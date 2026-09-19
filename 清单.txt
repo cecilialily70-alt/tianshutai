@@ -1,0 +1,72 @@
+天枢台（tianshutai）技术交接文档
+一、项目定位
+多标签、高防关联的出海聚合客服软件（类海易通）。核心场景：客服用中文回复，软件自动翻译成对方语言（默认希伯来语）发送；对方消息自动翻译成中文显示。
+
+二、技术内核（重点）
+层级	技术	版本/说明
+桌面框架
+Electron
+^44.3.0
+内置浏览器内核
+Chromium
+152（代码里 UA/指纹都对齐到 Chrome 152）
+UI 框架
+React + Vite
+React 18.3.1、Vite 5.4.11
+样式
+Tailwind CSS
+3.4.17，深色主题
+网页挂载
+BrowserView（非废弃 <webview>）
+每个账户一个 BrowserView
+数据存储
+electron-store
+^8.2.0（标签/设置/角色）
+缓存
+better-sqlite3（代码里引用，但未在 package.json 声明，失败回退 JSON 文件）
+翻译缓存 48h TTL
+进程通信
+contextBridge + IPC
+严格主/渲染进程隔离
+⚠️ 注意：better-sqlite3 在 translateCache.js / chatConfig.js 里被 require，但 package.json 依赖里没有它，所以目前运行时实际走的是 JSON 文件缓存兜底。这可能是一个需要修的 Bug/缺口。
+
+三、目录结构
+天枢台/
+├── package.json
+├── electron/                    # 主进程 (Main)
+│   ├── main.js                  # 主进程入口：窗口/视图/会话/IPC/环境隔离
+│   ├── preload.js               # 渲染进程桥 (shellAPI)
+│   ├── preload-whatsapp.js      # 注入 WhatsApp 页面的翻译+DOM 操作脚本
+│   ├── stealth-preload.js       # 反指纹脚本（时区/语言/WebGL/Canvas 等）
+│   ├── translation.js           # 语言/角色/翻译配置常量与规范化
+│   ├── translator.js            # 翻译引擎（DeepSeek/谷歌/OpenAI/Claude）
+│   ├── translateCache.js        # 翻译缓存（SQLite 兜底 JSON）
+│   └── chatConfig.js            # 每对话独立配置（SQLite 兜底 JSON）
+├── src/                         # 渲染进程 (React UI)
+│   ├── App.jsx                  # 主界面框架
+│   ├── lib/accountTab.js        # 账户标签数据结构
+│   ├── components/              # TabBar/Sidebar/EnvConfigDrawer/ZoomPanel/
+│   │                            #   PerChatConfigPanel/RoleManagerModal/等
+│   └── pages/                   # InboxPage / SettingsPage
+└── dist/                        # 构建产物
+四、核心功能清单
+多账户标签管理：增/删/重命名/拖拽排序标签；每个账户 = 独立 BrowserView + 独立 session.fromPartition('persist:账户ID')，Cookie/缓存完全隔离。
+环境隔离（防关联）：每账户独立配置——代理（HTTP/SOCKS5 直连）、User-Agent、时区、语言。
+自动地理适配：保存/重载时探测出口 IP 归属地，自动同步时区与浏览器语言（ipwho.is / ipinfo.io / ip-api.com 三接口兜底）。
+反指纹/反检测（stealth）：WebRTC 内网 IP 屏蔽、navigator 全套伪装（webdriver/userAgent/plugins/语言/硬件）、时区伪造（Intl+Date 重写）、WebGL/Canvas/Audio 加噪、window.chrome 存根、清理 Electron 痕迹、UA-CH 请求头注入。
+实时双向翻译：收到消息 → 自动翻译成中文追加在气泡下（Shadow DOM 隔离渲染）；发送中文 → 拦截回车/发送按钮 → 翻译成对方语言 → 真实事件回填+点击发送。
+多翻译渠道：DeepSeek（默认）、谷歌翻译（免费/历史消息用）、OpenAI GPT、Claude。
+角色 Prompt 管理：可自定义翻译/客服角色提示词（内置「中希女性翻译专家」「跨境电商客服」）。
+发送模式：Enter 发送 / Ctrl+Enter 发送 / 双输入框模式（独立翻译输入框）。
+每对话独立设置：可为单个联系人覆盖渠道/角色/目标语言，并自定义昵称与备注（注入头部+左侧列表改名）。
+全局联系人映射：左侧列表持续劫持显示自定义昵称。
+翻译缓存：按消息 ID 去重缓存，48 小时 TTL，带「重译」按钮。
+其它：页面缩放、站内/站外链接拦截（站外应用内新开隔离窗口）、无边框窗口拖拽+边缘缩放、登录状态探测、译文显隐开关。
+五、关键架构约定（修 Bug 必看）
+三环境日志前缀：主进程 [Main]、UI 渲染 [Renderer]、网页注入 [Preload-WhatsApp]，先看日志定位。
+IPC 全部走 preload：React 里只能调 window.shellAPI.*，严禁直接 require Node API。
+DOM 选择器铁律：WhatsApp 类名高度混淆，优先用语义化属性（[data-testid]、[aria-label]、[data-icon]），严禁硬编码混淆类名（如 .x1y1aw1k）。
+自定义 UI 必须 Shadow DOM 或哈希前缀类名（hyt-*-x8A9P），防风控和样式污染。
+发送模拟必须用真实事件（execCommand('insertText') + InputEvent + click()），触发 WhatsApp 自身 React 状态更新。
+观察器成对销毁：所有 MutationObserver/setInterval/addEventListener 都在 destroy() 里解绑（见 preload-whatsapp.js 的 destroy()）。
+发送防双发：isTranslatingAndSending / isEditingAndTranslating 锁 + 300ms 延迟释放。
