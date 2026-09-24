@@ -9,6 +9,7 @@
     "dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build": "vite build",
     "start": "electron .",
+    "test:preload": "electron test/whatsapp-preload/main.js",
     "dist": "electron-builder --win",
     "icon": "node build/make-icon.js"
   },

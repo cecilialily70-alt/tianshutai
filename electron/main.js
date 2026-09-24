@@ -361,9 +361,17 @@ function pumpTranslateQueue() {
     });
 }
 
-function enqueueTranslate(fn) {
+/**
+ * 翻译排队。
+ * urgent=true 的任务（用户正在发送的消息、当前屏幕上的气泡）插到队首，
+ * 优先于「历史消息批量补翻」—— 否则打开对话时几十条历史补翻会堵在队列里，
+ * 用户按了回车要等很久才发出去，看起来就像「没反应」。
+ */
+function enqueueTranslate(fn, urgent = false) {
   return new Promise((resolve, reject) => {
-    translateQueue.push({ fn, resolve, reject });
+    const job = { fn, resolve, reject };
+    if (urgent) translateQueue.unshift(job);
+    else translateQueue.push(job);
     pumpTranslateQueue();
   });
 }
@@ -384,7 +392,18 @@ async function handleTranslateMsg(event, payload = {}) {
   const settings = getEffectiveTranslation(accountId, chatId);
   const roles = store.get('roles') || [];
   const role = roles.find((item) => item.id === settings.roleId);
-  const channelOverride = forcePremium ? settings.channel || 'deepseek' : isHistory ? 'google' : settings.channel || 'deepseek';
+  const premium = settings.channel || 'deepseek';
+  // 付费通道没填 Key 时翻译必然失败（以前就表现为「点发送 / 回车没反应」）。
+  // 这种情况直接改走免密钥的谷歌通道，保证消息发得出去、历史译文出得来；
+  // 设置页里的红色提示会继续引导用户去填 Key。
+  const premiumReady = premium === 'google' || !!String(settings.apiKey || '').trim();
+  const channelOverride = !premiumReady
+    ? 'google'
+    : forcePremium
+      ? premium
+      : isHistory
+        ? 'google'
+        : premium;
 
   if (msgId && forcePremium) {
     translateCache?.delete(msgId);
@@ -402,12 +421,15 @@ async function handleTranslateMsg(event, payload = {}) {
     return translatePending.get(dedupeKey);
   }
 
+  // 用户正在发送的消息 / 屏幕上的气泡优先于历史批量补翻
   const work = enqueueTranslate(async () => {
     const ses = findViewSession(event.sender);
     console.log('[Main] 翻译请求', {
       direction,
       chars: text.length,
       channel: channelOverride,
+      configuredChannel: premium,
+      keyMissing: !premiumReady,
       isHistory,
       forcePremium,
       cached: false,
@@ -417,9 +439,6 @@ async function handleTranslateMsg(event, payload = {}) {
     // 保证历史消息「必然出译文」并被缓存，避免再次打开时历史翻译缺失。
     let translated = '';
     let usedChannel = channelOverride;
-    const premium = settings.channel || 'deepseek';
-    // 付费渠道没填 Key 时就不要白跑一趟（以前会一路失败到底，历史全是「翻译失败」）
-    const premiumReady = premium === 'google' || !!String(settings.apiKey || '').trim();
 
     const runChannel = (channel) =>
       translateText({
@@ -457,7 +476,7 @@ async function handleTranslateMsg(event, payload = {}) {
       translateCache?.set(msgId, { text, translated, channel: usedChannel });
     }
     return { ok: true, text: translated, cached: false, channel: usedChannel };
-  }).catch((error) => {
+  }, !isHistory).catch((error) => {
     console.error('[Main] 翻译失败', error.message || error);
     return { ok: false, error: error.message || '翻译失败' };
   });

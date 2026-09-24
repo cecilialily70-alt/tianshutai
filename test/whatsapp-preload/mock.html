@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>WhatsApp Mock</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; background: #efeae2; }
+      #app { display: flex; }
+      #pane-side { width: 240px; background: #fff; }
+      #main { flex: 1; }
+      header { height: 48px; background: #f0f2f5; display: flex; align-items: center; padding: 0 12px; }
+      [data-testid='conversation-panel-messages'] { height: 420px; overflow-y: auto; padding: 10px; }
+      .copyable-text { background: #fff; border-radius: 8px; padding: 6px 8px; margin: 6px 0; max-width: 420px; }
+      footer { background: #f0f2f5; padding: 10px 12px; display: flex; gap: 8px; align-items: center; }
+      [data-testid='conversation-compose-box-input'] {
+        flex: 1; min-height: 32px; background: #fff; border-radius: 8px; padding: 6px 8px;
+        outline: none; font-size: 14px;
+      }
+      #sent-log { font-size: 11px; color: #444; padding: 8px 12px; background: #fff; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="pane-side">
+        <div role="listitem"><div role="gridcell" tabindex="-1">+972 50-905-2770</div></div>
+      </div>
+      <div id="main">
+        <header>
+          <div>
+            <div><span dir="auto" title="+972 50-905-2770">+972 50-905-2770</span></div>
+            <div><span dir="auto">在线</span></div>
+          </div>
+        </header>
+
+        <div data-testid="conversation-panel-wrapper">
+          <div data-testid="conversation-panel-messages">
+            <!-- ① 新版格式 + 收到 -->
+            <div data-id="ACC7C812269A052CD6C6CE9998BBBE45" data-testid="conv-msg-ACC7C812269A052CD6C6CE9998BBBE45">
+              <div data-testid="msg-container">
+                <span data-testid="tail-in" data-icon="tail-in"></span>
+                <div class="copyable-text" data-pre-plain-text="[17:15, 2026年6月9日] +972 50-905-2770: ">
+                  <div>
+                    <span data-testid="selectable-text" dir="rtl"><span>שלום אחד</span></span>
+                    <span><span>17:15</span></span>
+                  </div>
+                </div>
+              </div>
+              <div data-testid="addon-bubble-container"></div>
+            </div>
+
+            <!-- ② 新版格式 + 收到 -->
+            <div data-id="B1C7C812269A052CD6C6CE9998BBBE46" data-testid="conv-msg-B1C7C812269A052CD6C6CE9998BBBE46">
+              <div data-testid="msg-container">
+                <span data-testid="tail-in" data-icon="tail-in"></span>
+                <div class="copyable-text">
+                  <div>
+                    <span data-testid="selectable-text" dir="rtl"><span>מה שלומך היום</span></span>
+                    <span><span>17:16</span></span>
+                  </div>
+                </div>
+              </div>
+              <div data-testid="addon-bubble-container"></div>
+            </div>
+
+            <!-- ③ 新版格式 + 发出 -->
+            <div data-id="C2C7C812269A052CD6C6CE9998BBBE47" data-testid="conv-msg-C2C7C812269A052CD6C6CE9998BBBE47">
+              <div data-testid="msg-container">
+                <span data-testid="tail-out" data-icon="tail-out"></span>
+                <div class="copyable-text">
+                  <div>
+                    <span data-testid="selectable-text" dir="rtl"><span>אני בסדר תודה</span></span>
+                    <span><span data-icon="msg-dblcheck">17:17</span></span>
+                  </div>
+                </div>
+              </div>
+              <div data-testid="addon-bubble-container"></div>
+            </div>
+
+            <!-- ④ 旧版格式 + 收到（向后兼容） -->
+            <div data-id="false_447934711861@c.us_3EB0A26F4CD30210EC51EF">
+              <div data-testid="msg-container">
+                <span data-testid="tail-in" data-icon="tail-in"></span>
+                <div class="copyable-text">
+                  <div>
+                    <span data-testid="selectable-text" dir="rtl"><span>תודה רבה לך</span></span>
+                    <span><span>17:18</span></span>
+                  </div>
+                </div>
+              </div>
+              <div data-testid="addon-bubble-container"></div>
+            </div>
+
+            <!-- ⑤ 旧版格式 + 发出（向后兼容） -->
+            <div data-id="true_447934711861@c.us_3EB0A26F4CD30210EC51F0">
+              <div data-testid="msg-container">
+                <span data-testid="tail-out" data-icon="tail-out"></span>
+                <div class="copyable-text">
+                  <div>
+                    <span data-testid="selectable-text" dir="rtl"><span>יום טוב</span></span>
+                    <span><span data-icon="msg-dblcheck">17:19</span></span>
+                  </div>
+                </div>
+              </div>
+              <div data-testid="addon-bubble-container"></div>
+            </div>
+
+            <!-- ⑥ 纯中文：不应被翻译 -->
+            <div data-id="D3C7C812269A052CD6C6CE9998BBBE48" data-testid="conv-msg-D3C7C812269A052CD6C6CE9998BBBE48">
+              <div data-testid="msg-container">
+                <span data-testid="tail-out" data-icon="tail-out"></span>
+                <div class="copyable-text">
+                  <div>
+                    <span data-testid="selectable-text" dir="auto"><span>你好，这是一条中文消息</span></span>
+                    <span><span data-icon="msg-dblcheck">17:20</span></span>
+                  </div>
+                </div>
+              </div>
+              <div data-testid="addon-bubble-container"></div>
+            </div>
+
+            <!-- ⑦ WhatsApp 系统提示：不应被翻译 -->
+            <div data-id="E4C7C812269A052CD6C6CE9998BBBE49" data-testid="conv-msg-E4C7C812269A052CD6C6CE9998BBBE49">
+              <div data-testid="msg-container">
+                <span data-testid="system_message">消息已进行端到端加密。</span>
+              </div>
+              <div data-testid="addon-bubble-container"></div>
+            </div>
+          </div>
+        </div>
+
+        <footer data-testid="conversation-compose">
+          <div
+            contenteditable="true"
+            role="textbox"
+            data-tab="10"
+            data-testid="conversation-compose-box-input"
+          ><p data-lexical-text="true"></p></div>
+          <button aria-label="发送" type="button"><span data-icon="wds-ic-send-filled"></span></button>
+        </footer>
+
+        <div id="sent-log">已发送（模拟）：<span id="sent-items"></span></div>
+      </div>
+    </div>
+
+    <script>
+      // ──────────────────────────────────────────────────────────────
+      // 模拟 WhatsApp 的输入框（Lexical 富文本编辑器）的关键行为：
+      //  1. 编辑器有自己的内部状态，会持续把 DOM 收敛回自己的状态；
+      //     绕过编辑器直接改 DOM（例如 document.execCommand）会被覆盖掉 ——
+      //     这正是真实环境里 execCommand 换不掉文字的原因。
+      //  2. 收到 beforeinput 时才真正接管并写入。
+      //  3. DOM 重渲染是异步的，同步读字段只能读到旧值。
+      // ──────────────────────────────────────────────────────────────
+      const box = document.querySelector('[data-testid="conversation-compose-box-input"]');
+      const line = box.querySelector('p');
+      let editorState = '';
+      let sent = [];
+
+      const render = () => {
+        if (line.textContent !== editorState) line.textContent = editorState;
+      };
+      // 编辑器会立刻把自己的状态写回 DOM：任何绕过编辑器直接改动 DOM 的操作
+      // （例如 document.execCommand('insertText')）都会被同步覆盖掉 ——
+      // 这正是真实环境里「execCommand 换不掉 3 个字以上内容」的本质。
+      // 用 MutationObserver 而不是定时器，保证回滚发生在下一个微任务，确定且可复现。
+      new MutationObserver(() => {
+        if (line.textContent !== editorState) render();
+      }).observe(line, { childList: true, characterData: true, subtree: true });
+      setInterval(render, 50);
+
+      box.addEventListener('beforeinput', (event) => {
+        if (event.inputType === 'insertText') {
+          event.preventDefault();
+          editorState = String(event.data ?? '');
+          setTimeout(render, 15);
+        } else if (event.inputType === 'deleteContentBackward') {
+          event.preventDefault();
+          editorState = '';
+          setTimeout(render, 15);
+        }
+      });
+
+      box.addEventListener('keydown', (event) => {
+        // 模拟用户按回车发送（不经过我们的 preload 时才会走到这里）
+        if (event.key !== 'Enter' || event.isComposing) return;
+        if (!editorState) return;
+        event.preventDefault();
+        sent.push(editorState);
+        editorState = '';
+        render();
+        updateSentLog();
+      });
+
+      document.querySelector('button[aria-label="发送"]').addEventListener('click', () => {
+        if (!editorState) return;
+        sent.push(editorState);
+        editorState = '';
+        render();
+        updateSentLog();
+      });
+
+      function updateSentLog() {
+        document.getElementById('sent-items').textContent = JSON.stringify(sent);
+      }
+
+      // 测试辅助：模拟用户（输入法）把一段文字打进输入框
+      window.__type = (text) => {
+        editorState = editorState + text;
+        render();
+      };
+      window.__sent = () => sent;
+      window.__reset = () => {
+        sent = [];
+        editorState = '';
+        render();
+        updateSentLog();
+      };
+      window.__pressEnter = () => {
+        box.focus();
+        box.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true, cancelable: true }),
+        );
+      };
+      window.__editorText = () => (box.innerText || '').replace(/\u200b/g, '').trim();
+    </script>
+  </body>
+</html>

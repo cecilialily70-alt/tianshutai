@@ -10,6 +10,8 @@ try {
   // 否则会出现在某些 WhatsApp 版本里气泡被挂到消息行外面 —— 既不在气泡下方，
   // 也会让「已翻译就跳过」的判断失效，导致同一条消息被反复送去翻译。
   const MESSAGE_TEXT_SELECTORS = [
+    // 现役 WhatsApp Web 的消息正文节点
+    '[data-testid="selectable-text"]',
     '[data-testid="conversation-text"]',
     'span[data-testid="text-content"]',
     '[data-testid="msg-text"]',
@@ -187,8 +189,10 @@ try {
   }
 
   async function confirmEdit(compose, translated) {
-    setComposeText(compose, translated);
-    await wait(40);
+    // 确认编辑器真的填好了译文，否则点“确认”就会把原文（中文）提交上去
+    if (!(await setComposeText(compose, translated))) {
+      throw new Error('译文没能写入输入框，已取消本次编辑');
+    }
     const btn = findEditConfirmButton();
     if (btn && typeof btn.click === 'function') {
       btn.click();
@@ -210,15 +214,17 @@ try {
       const translated = await requestTranslate(original, 'out');
       if (mustBlockChinese(translated)) {
         showToast('已阻止发送：内容仍含中文（禁止发送中文）');
-        setComposeText(compose, original);
+        await setComposeText(compose, original);
         return;
       }
       await confirmEdit(compose, translated);
       console.log('[Preload-WhatsApp] 编辑消息翻译完成', { chars: original.length });
     } catch (error) {
       console.error('[Preload-WhatsApp] 编辑翻译失败', error);
-      setComposeText(compose, original);
-      showToast(describeTranslateError(error));
+      await setComposeText(compose, original);
+      const raw = String(error?.message || '');
+      if (/已阻止|已取消|取消本次发送|取消本次编辑/.test(raw)) showToast(raw);
+      else showToast(describeTranslateError(error));
     } finally {
       setTimeout(() => {
         isEditingAndTranslating = false;
@@ -288,29 +294,100 @@ try {
     return (el.innerText || el.textContent || '').replace(/\u200b/g, '').trim();
   }
 
-  function setComposeText(el, text) {
-    if (!el) return false;
-    el.focus();
-    const selection = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    selection.removeAllRanges();
-    selection.addRange(range);
+  /** 选中输入框全部内容（WhatsApp 输入框是 Lexical 富文本，替换必须走「选区 + beforeinput」） */
+  function selectComposeContents(el) {
+    try {
+      el.focus();
+      const selection = window.getSelection();
+      if (!selection) return false;
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
 
-    const inserted = document.execCommand('insertText', false, text);
-    if (!inserted) {
-      el.textContent = text;
-      el.dispatchEvent(
-        new InputEvent('input', {
+  /** 等编辑器把 DOM 重渲染出来再比对（Lexical 的更新是异步的，立刻读只能读到旧值） */
+  async function waitComposeEquals(el, value, timeout = 900) {
+    for (let waited = 0; waited <= timeout; waited += 30) {
+      if (getComposeText(el) === value) return true;
+      await wait(30);
+    }
+    return getComposeText(el) === value;
+  }
+
+  /**
+   * 把文本整体写进 WhatsApp 输入框，并**逐字校验**是否真的写成功。
+   *
+   * ⚠️ 这里是「发 2 个字会翻译、字数一多就不翻译」和「禁止发送中文时灵时不灵」的真正病根：
+   * WhatsApp 输入框是 Lexical 富文本编辑器，`document.execCommand('insertText')`
+   * 在内容超过 2 个字符时会被它直接忽略，但 execCommand 依然返回 true。
+   * 于是程序「以为已经把译文填进去了」，实际输入框里还是原来那段中文，
+   * 紧接着点发送 —— 发出去的就是中文原文（既没翻译，拦截也等于没生效）。
+   *
+   * 可靠路径：
+   *   ① 选中全部内容
+   *   ② 派发 beforeinput，让 Lexical 自己完成替换（execCommand 完全不可信）
+   *   ③ 等它重渲染完（异步！），再逐字校验；不通过就重试。
+   * 校验始终不通过时返回 false —— 调用方必须放弃这次发送，绝不能把中文发出去。
+   */
+  async function setComposeText(el, text) {
+    if (!el) return false;
+    const value = String(text ?? '');
+
+    // 清空输入框
+    if (!value) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        selectComposeContents(el);
+        try {
+          el.dispatchEvent(
+            new InputEvent('beforeinput', {
+              bubbles: true,
+              cancelable: true,
+              inputType: 'deleteContentBackward',
+            }),
+          );
+        } catch (error) {
+          /* 个别环境不支持 InputEvent，走下面的兜底 */
+        }
+        if (await waitComposeEquals(el, '', 400)) return true;
+        try {
+          const host = el.querySelector('p') || el;
+          host.textContent = '';
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+        } catch (error) {
+          /* 忽略 */
+        }
+        if (await waitComposeEquals(el, '', 400)) return true;
+      }
+      return getComposeText(el) === '';
+    }
+
+    // 最多试 3 轮：每轮写完都等重渲染并校验，绝不允许「以为换了其实没换」
+    for (let attempt = 0; attempt < 3; attempt++) {
+      selectComposeContents(el);
+      try {
+        const event = new InputEvent('beforeinput', {
           bubbles: true,
           cancelable: true,
           inputType: 'insertText',
-          data: text,
-        }),
-      );
+          data: value,
+        });
+        el.dispatchEvent(event);
+      } catch (error) {
+        console.error('[Preload-WhatsApp] 写入输入框失败', error);
+      }
+      if (await waitComposeEquals(el, value, 900)) return true;
     }
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    return getComposeText(el).length > 0 || !text;
+
+    console.warn('[Preload-WhatsApp] 写入输入框校验未通过', {
+      want: value.slice(0, 24),
+      got: getComposeText(el).slice(0, 24),
+    });
+    return false;
   }
 
   function dispatchEnter(el) {
@@ -341,14 +418,26 @@ try {
   }
 
   async function sendFilled(el, translated, preferEnter) {
-    // 最后一道闸：不管前面怎么来的，只要最终要发的内容含中文就不发
-    if (mustBlockChinese(translated)) {
+    const target = String(translated ?? '');
+    // 第一道闸：不管前面怎么来的，只要最终要发的内容含中文就不发
+    if (mustBlockChinese(target)) {
       showToast('已阻止发送：内容仍含中文（禁止发送中文）');
-      console.warn('[Preload-WhatsApp] 最终拦截含中文内容', { chars: String(translated || '').length });
+      console.warn('[Preload-WhatsApp] 最终拦截含中文内容', { chars: target.length });
       throw new Error('已阻止发送：内容仍含中文');
     }
-    setComposeText(el, translated);
+    // 第二道闸：确认译文真的写进输入框了。
+    // 写失败时必须取消发送，否则发出去的就是输入框里残留的原文中文。
+    if (!(await setComposeText(el, target))) {
+      throw new Error('译文没能写入输入框，已取消本次发送');
+    }
     await wait(40);
+    // 第三道闸：写完再看一眼，输入框里但凡还有中文一律不发
+    const staged = getComposeText(el);
+    if (hasChinese(staged)) {
+      showToast('已阻止发送：输入框里还有中文（禁止发送中文）');
+      console.warn('[Preload-WhatsApp] 输入框仍含中文，取消发送', { chars: staged.length });
+      throw new Error('输入框里还有中文，已取消本次发送');
+    }
     if (preferEnter) {
       dispatchEnter(el);
       await wait(80);
@@ -502,12 +591,41 @@ try {
     }
   }
 
+  /** 统一的「彻底阻断这次原生事件」 */
+  function blockEvent(event) {
+    if (!event) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+  }
+
+  /** 给翻译请求加超时：网络卡死时不能一直锁着发送（否则用户会觉得程序坏了） */
+  function withTimeout(promise, ms, message) {
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => reject(new Error(message)), ms);
+      promise.then(
+        (value) => {
+          window.clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          window.clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
   async function requestTranslate(text, direction) {
     const shouldSkip =
       (direction === 'out' && state.settings.translateOutgoing === false) ||
       (direction === 'in' && state.settings.translateIncoming === false);
     if (shouldSkip) return text;
-    const result = await ipcRenderer.invoke('translate:run', { text, direction, chatId: state.chatId });
+    const result = await withTimeout(
+      ipcRenderer.invoke('translate:run', { text, direction, chatId: state.chatId }),
+      20000,
+      '翻译请求超时（网络无响应）',
+    );
     if (!result?.ok) throw new Error(result?.error || '翻译失败');
     return String(result.text || '').trim() || text;
   }
@@ -581,11 +699,7 @@ try {
 
   /** 被拦下时的统一处理：能翻译就先翻译再发，否则直接提示 */
   function handleBlockedChinese(event, compose, source) {
-    if (event) {
-      event.preventDefault();
-      event.stopPropagation();
-      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
-    }
+    blockEvent(event);
     if (state.settings.translateOutgoing !== false) {
       // 交给翻译链路：译文若仍含中文会在 sendFilled 里被再次拦下
       void interceptAndSend(compose, source);
@@ -630,7 +744,7 @@ try {
     try {
       // 编辑消息模式走独立的 onEditKeydown，避免与普通发送拦截互相干扰
       if (isEditingMode()) return;
-      if (isDualMode() || isTranslatingAndSending) return;
+      if (isDualMode()) return;
       // 只关心「这一次回车就是发送」
       if (!isSendEnter(event)) return;
       const compose = findActiveCompose(event);
@@ -639,17 +753,23 @@ try {
       if (!source) return;
       // 禁止发送中文（默认开启）：含中文一律不许原生发送出去
       if (mustBlockChinese(source)) {
+        // 上一条还在翻译时也绝不放行 —— 以前这里直接 return，
+        // WhatsApp 就原生把中文发了出去（表现为「拦截时灵时不灵」）。
+        if (isTranslatingAndSending) {
+          blockEvent(event);
+          showToast('正在翻译上一条，请稍候再发');
+          return;
+        }
         handleBlockedChinese(event, compose, source);
         return;
       }
+      if (isTranslatingAndSending) return;
       // 不翻译时保持原样，让 WhatsApp 自己发送
       if (state.settings.translateOutgoing === false) return;
       // 非 ctrl+回车模式只拦截中文，避免影响用户直接发送外文
       if (state.settings.enterSendMode !== 'ctrlEnter' && !HAS_CHINESE.test(source)) return;
       // 彻底阻断原生发送：在进入异步翻译前立即拦截，阻止 WhatsApp 的 React 处理器收到此事件
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
+      blockEvent(event);
       void interceptAndSend(compose, source);
     } catch (error) {
       console.error('[Preload-WhatsApp] 拦截回车失败', error);
@@ -669,8 +789,12 @@ try {
       console.log('[Preload-WhatsApp] 原输入框拦截翻译发送', { chars: original.length });
     } catch (error) {
       console.error('[Preload-WhatsApp] 拦截翻译失败', error);
-      setComposeText(compose, original);
-      showToast(describeTranslateError(error));
+      // 把原文还回输入框（写回同样走校验，即使失败也不会把中文发出去）
+      await setComposeText(compose, original);
+      const raw = String(error?.message || '');
+      // 拦截/取消类提示本身就是人话，直接展示，不要再包一层「翻译失败」
+      if (/已阻止|已取消|取消本次发送/.test(raw)) showToast(raw);
+      else showToast(describeTranslateError(error));
     } finally {
       // 发送彻底完成后延迟释放锁，避免残留事件再次触发发送
       setTimeout(() => {
@@ -689,7 +813,7 @@ try {
     try {
       // 兜底：阻止用户直接点击“发送”按钮把中文发出去
       if (isEditingMode()) return;
-      if (isDualMode() || isTranslatingAndSending) return;
+      if (isDualMode()) return;
       const target = event.target;
       if (!(target instanceof Element)) return;
       const btn = target.closest?.('button');
@@ -700,14 +824,18 @@ try {
       if (!source) return;
       // 禁止发送中文（默认开启）：点发送按钮同样拦下
       if (mustBlockChinese(source)) {
+        if (isTranslatingAndSending) {
+          blockEvent(event);
+          showToast('正在翻译上一条，请稍候再发');
+          return;
+        }
         handleBlockedChinese(event, compose, source);
         return;
       }
+      if (isTranslatingAndSending) return;
       if (state.settings.translateOutgoing === false) return;
       if (!HAS_CHINESE.test(source)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+      blockEvent(event);
       void interceptAndSend(compose, source);
     } catch (error) {
       console.error('[Preload-WhatsApp] 拦截发送按钮失败', error);
@@ -1059,26 +1187,70 @@ try {
     }
   }
 
+  // ───────────────────── 消息行识别 ─────────────────────
+  // WhatsApp Web 的 DOM 有两代格式，必须都认：
+  //   旧版：data-id="false_447934711861@c.us_3EB0A26F4CD30210EC51EF"（true_/false_ 前缀 + JID + 消息ID）
+  //   新版：data-id="ACC7C812269A052CD6C6CE9998BBBE45"（纯 32 位消息ID，无前缀、无 JID）
+  //        同一行还带 data-testid="conv-msg-ACC7C812269A052CD6C6CE9998BBBE45"
+  // 早先只认 true_/false_ 前缀，导致新版下一个消息都匹配不到：
+  // 历史快照、批量补翻、IntersectionObserver 全部拿到空列表 →
+  // 用户点开对话，已加载的历史消息一条译文都没有（新来的消息才偶尔被翻）。
+  const MSG_ROW_CANDIDATES =
+    '[data-testid^="conv-msg-"], [data-id], [data-testid="msg-container"]';
+  const OLD_MSG_ID = /^(?:true|false)_/;
+  const BARE_MSG_ID = /^[0-9A-F]{12,}$/i;
+
+  function isMsgRowId(id) {
+    const value = String(id || '');
+    return OLD_MSG_ID.test(value) || BARE_MSG_ID.test(value);
+  }
+
+  /** 把任意候选节点归位成「真正承载 data-id 的那条消息行」 */
+  function messageRowOf(node) {
+    if (!node || node.nodeType !== 1 || !node.isConnected) return null;
+    let row = null;
+    if (isMsgRowId(node.getAttribute('data-id'))) row = node;
+    else {
+      const owner = node.closest('[data-id]');
+      if (owner && isMsgRowId(owner.getAttribute('data-id'))) row = owner;
+    }
+    if (!row) return null;
+    // WhatsApp 自己的系统提示（端到端加密说明、日期分隔、安全码变更等）不是聊天内容：
+    // 既没必要翻译，气泡挂进去还会和正文重叠，直接跳过。
+    if (row.querySelector('[data-testid="system_message"]')) return null;
+    return row;
+  }
+
   function listMessageNodes(panel) {
     if (!panel) return [];
-    const nodes = panel.querySelectorAll('[data-id], [data-testid="msg-container"]');
-    return Array.from(nodes).filter((node) => {
-      const id = getMsgId(node);
-      return id.startsWith('true') || id.startsWith('false');
+    const rows = [];
+    const seen = new Set();
+    panel.querySelectorAll(MSG_ROW_CANDIDATES).forEach((node) => {
+      const row = messageRowOf(node);
+      if (!row) return;
+      const id = getMsgId(row);
+      // 同一行可能被多个候选选择器命中，按消息 ID 去重，保证一条消息只处理一次
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      rows.push(row);
     });
+    return rows;
   }
 
   function getMsgId(node) {
-    return node.getAttribute('data-id') || node.closest('[data-id]')?.getAttribute('data-id') || '';
+    const row = isMsgRowId(node?.getAttribute?.('data-id')) ? node : node?.closest?.('[data-id]');
+    return row?.getAttribute('data-id') || '';
   }
 
   function isOutgoingMessage(node) {
     const id = getMsgId(node);
     if (id.startsWith('false')) return true;
     if (id.startsWith('true')) return false;
-    if (node.querySelector('[data-testid="tail-out"]') || node.querySelector('span[data-icon="tail-out"]')) {
-      return true;
-    }
+    // 新版 data-id 不带收发信息，靠气泡尾巴判断：
+    if (node.querySelector('[data-testid="tail-out"], [data-icon="tail-out"]')) return true;
+    if (node.querySelector('[data-testid="tail-in"], [data-icon="tail-in"]')) return false;
+    // 兜底：自己发出的消息一定带勾（单勾/双勾）
+    if (node.querySelector('[data-icon^="msg-dblcheck"], [data-icon^="msg-check"]')) return true;
     return false;
   }
 
@@ -1170,10 +1342,15 @@ try {
       event.stopPropagation();
       void refreshBubble(node, host);
     });
+    // 优先挂在 WhatsApp 自己预留的「气泡附加内容槽」（addon-bubble-container）里：
+    // 位置正好在气泡正下方，不会和正文/时间挤在一起，也最不容易被 WhatsApp 重渲染冲掉。
+    // 拿不到槽位时退回正文节点的父容器，最后退回消息行本身 —— 但绝不挂到行外面，
+    // 否则会变成「整行下方一条」且「已翻译就跳过」的判断失效（同一条消息被反复送去翻译）。
+    const addon = node.querySelector('[data-testid="addon-bubble-container"]');
     const textRoot = qsFirst(node, MESSAGE_TEXT_SELECTORS);
-    // 气泡必须挂在消息行内部：拿不到正文节点时退回行本身，
-    // 绝不挂到行外面（否则会变成「整行下方一条」且无法被去重判断识别）
-    const inner = textRoot && textRoot.parentElement && node.contains(textRoot.parentElement) ? textRoot.parentElement : node;
+    const inner =
+      addon ||
+      (textRoot && textRoot.parentElement && node.contains(textRoot.parentElement) ? textRoot.parentElement : node);
     inner.appendChild(host);
     return host;
   }
@@ -1240,7 +1417,8 @@ try {
     }, 320);
   }
 
-  const MAX_IPC = 2;
+  // 历史补翻会一次性入队几十条，并发开大一点让译文尽快铺满整屏
+  const MAX_IPC = 4;
 
   function enqueueBubble(node, options = {}) {
     try {
@@ -1363,15 +1541,19 @@ try {
   function onMessagesMutated(mutations, panel) {
     try {
       const addedRows = [];
+      const addedIds = new Set();
       mutations.forEach((mutation) => {
         mutation.addedNodes.forEach((node) => {
           if (!(node instanceof Element)) return;
-          const rows = node.matches?.('[data-id], [data-testid="msg-container"]')
+          const candidates = node.matches?.(MSG_ROW_CANDIDATES)
             ? [node]
-            : Array.from(node.querySelectorAll?.('[data-id], [data-testid="msg-container"]') || []);
-          rows.forEach((row) => {
+            : Array.from(node.querySelectorAll?.(MSG_ROW_CANDIDATES) || []);
+          candidates.forEach((candidate) => {
+            const row = messageRowOf(candidate);
+            if (!row) return;
             const id = getMsgId(row);
-            if (!id) return;
+            if (!id || addedIds.has(id)) return;
+            addedIds.add(id);
             const rowsNow = listMessageNodes(panel);
             const index = rowsNow.indexOf(row);
             const appendedBottom = index >= rowsNow.length - 2;
