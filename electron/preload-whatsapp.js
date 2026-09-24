@@ -6,6 +6,17 @@ try {
   const CONTAINER_CLASS = 'hyt-translate-container';
   const HAS_CHINESE = /[\u4e00-\u9fff]/;
   const HAS_FOREIGN = /[\u0590-\u05FF\u0600-\u06FF\u0400-\u04FF\u3040-\u30FF\uAC00-\uD7AF]|[A-Za-z]{3,}/;
+  // 取「消息正文节点」与「挂译文气泡的锚点」必须用同一份选择器，
+  // 否则会出现在某些 WhatsApp 版本里气泡被挂到消息行外面 —— 既不在气泡下方，
+  // 也会让「已翻译就跳过」的判断失效，导致同一条消息被反复送去翻译。
+  const MESSAGE_TEXT_SELECTORS = [
+    '[data-testid="conversation-text"]',
+    'span[data-testid="text-content"]',
+    '[data-testid="msg-text"]',
+    'span[dir="ltr"]',
+    'span[dir="rtl"]',
+    'span[dir="auto"]',
+  ];
 
   const state = {
     settings: {
@@ -13,6 +24,8 @@ try {
       enterSendMode: 'enter',
       translateOutgoing: true,
       translateIncoming: true,
+      // 禁止发送中文：默认开启，任何含中文的内容都不允许发出去
+      blockChinese: true,
       channelLabel: 'GPT',
       outgoingLangLabel: '希伯来语',
     },
@@ -20,6 +33,7 @@ try {
     destroyed: false,
     observer: null,
     msgObserver: null,
+    observedPanel: null,
     io: null,
     obsTimer: null,
     pollTimer: null,
@@ -33,6 +47,7 @@ try {
     queued: new Map(),
     active: 0,
     lastLoggedIn: null,
+    selfPhone: '',
     chatId: '',
     chatTitle: '',
     customId: '',
@@ -186,13 +201,24 @@ try {
     if (isEditingAndTranslating) return;
     isEditingAndTranslating = true;
     const original = source;
+    showToast('正在翻译…', 'ok');
     try {
+      if (mustBlockChinese(original) && state.settings.translateOutgoing === false) {
+        showToast('已阻止发送：请先翻译成外文（禁止发送中文）');
+        return;
+      }
       const translated = await requestTranslate(original, 'out');
+      if (mustBlockChinese(translated)) {
+        showToast('已阻止发送：内容仍含中文（禁止发送中文）');
+        setComposeText(compose, original);
+        return;
+      }
       await confirmEdit(compose, translated);
       console.log('[Preload-WhatsApp] 编辑消息翻译完成', { chars: original.length });
     } catch (error) {
       console.error('[Preload-WhatsApp] 编辑翻译失败', error);
       setComposeText(compose, original);
+      showToast(describeTranslateError(error));
     } finally {
       setTimeout(() => {
         isEditingAndTranslating = false;
@@ -209,6 +235,13 @@ try {
       if (!compose) return;
       const source = getComposeText(compose);
       if (!source) return;
+      if (mustBlockChinese(source)) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        void handleEditSend(compose, source);
+        return;
+      }
       if (!HAS_CHINESE.test(source)) return;
       event.preventDefault();
       event.stopPropagation();
@@ -233,6 +266,13 @@ try {
       if (!compose) return;
       const source = getComposeText(compose);
       if (!source) return;
+      if (mustBlockChinese(source)) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        void handleEditSend(compose, source);
+        return;
+      }
       if (!HAS_CHINESE.test(source)) return;
       event.preventDefault();
       event.stopPropagation();
@@ -301,6 +341,12 @@ try {
   }
 
   async function sendFilled(el, translated, preferEnter) {
+    // 最后一道闸：不管前面怎么来的，只要最终要发的内容含中文就不发
+    if (mustBlockChinese(translated)) {
+      showToast('已阻止发送：内容仍含中文（禁止发送中文）');
+      console.warn('[Preload-WhatsApp] 最终拦截含中文内容', { chars: String(translated || '').length });
+      throw new Error('已阻止发送：内容仍含中文');
+    }
     setComposeText(el, translated);
     await wait(40);
     if (preferEnter) {
@@ -421,9 +467,14 @@ try {
     if (state.busy) return;
     const source = String(textarea.value || '').trim();
     if (!source) return;
+    if (mustBlockChinese(source) && state.settings.translateOutgoing === false) {
+      showToast('已阻止发送：请先翻译成外文（禁止发送中文）');
+      return;
+    }
     const compose = findComposeBox();
     if (!compose) {
       console.warn('[Preload-WhatsApp] 未找到 WhatsApp 输入框');
+      showToast('翻译失败：没有找到 WhatsApp 输入框，请先打开一个对话');
       return;
     }
     state.busy = true;
@@ -431,6 +482,7 @@ try {
     textarea.disabled = true;
     button.disabled = true;
     textarea.placeholder = '翻译中…';
+    showToast('正在翻译…', 'ok');
     try {
       const translated = await requestTranslate(source, 'out');
       textarea.value = '';
@@ -438,7 +490,9 @@ try {
       console.log('[Preload-WhatsApp] 双输入框已翻译发送', { chars: source.length });
     } catch (error) {
       console.error('[Preload-WhatsApp] 双输入框翻译失败', error);
-      textarea.placeholder = error.message || '翻译失败';
+      const readable = describeTranslateError(error);
+      textarea.placeholder = readable.replace(/^翻译失败：/, '');
+      showToast(readable);
     } finally {
       textarea.disabled = false;
       button.disabled = false;
@@ -466,16 +520,131 @@ try {
     return !event.ctrlKey && !event.metaKey;
   }
 
+  // ---------- 禁止发送中文 ----------
+  // 开关打开（默认）时，只要待发送内容含中文就绝不发给对方。
+  function isChineseBlockOn() {
+    return state.settings.blockChinese !== false;
+  }
+
+  function hasChinese(text) {
+    return HAS_CHINESE.test(String(text || ''));
+  }
+
+  /** 待发送内容是否必须被拦下（开关打开 + 含中文） */
+  function mustBlockChinese(text) {
+    return isChineseBlockOn() && hasChinese(text);
+  }
+
+  let toastTimer = null;
+
+  /** 右下角浮出提示，告诉用户「消息没发出去」及原因 */
+  function showToast(message, type) {
+    try {
+      let el = document.getElementById('hyt-toast-x8A9P');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'hyt-toast-x8A9P';
+        el.style.cssText = [
+          'position:fixed',
+          'left:50%',
+          'bottom:96px',
+          'transform:translateX(-50%)',
+          'z-index:2147483647',
+          'max-width:80%',
+          'padding:10px 16px',
+          'border-radius:10px',
+          'font-size:13px',
+          'line-height:1.5',
+          'box-shadow:0 6px 20px rgba(0,0,0,.45)',
+          'pointer-events:none',
+          'transition:opacity .18s ease',
+          'font-family:"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif',
+        ].join(';');
+        document.body.appendChild(el);
+      }
+      el.textContent = message;
+      el.style.background = type === 'ok' ? '#005c4b' : '#7f1d1d';
+      el.style.color = '#fff';
+      el.style.opacity = '1';
+      if (toastTimer) window.clearTimeout(toastTimer);
+      // 失败提示要多留一会儿，用户得看清「为什么没发出去、去哪儿改」
+      toastTimer = window.setTimeout(
+        () => {
+          el.style.opacity = '0';
+        },
+        type === 'ok' ? 1600 : 6000,
+      );
+    } catch (error) {
+      console.error('[Preload-WhatsApp] 提示浮层失败', error);
+    }
+  }
+
+  /** 被拦下时的统一处理：能翻译就先翻译再发，否则直接提示 */
+  function handleBlockedChinese(event, compose, source) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+    }
+    if (state.settings.translateOutgoing !== false) {
+      // 交给翻译链路：译文若仍含中文会在 sendFilled 里被再次拦下
+      void interceptAndSend(compose, source);
+      return;
+    }
+    showToast('已阻止发送：请先翻译成外文（禁止发送中文）');
+    console.warn('[Preload-WhatsApp] 已阻止发送中文', { chars: source.length });
+  }
+
+  /**
+   * 把翻译失败的原因翻成用户能看懂的话。
+   * 最常见的就是「没填 API Key」——以前这里是静默失败，用户只看到没反应。
+   */
+  function describeTranslateError(error) {
+    const raw = String(error?.message || error || '').trim() || '翻译失败';
+    if (/未配置\s*API\s*Key/i.test(raw)) {
+      return '翻译失败：没有填写 API Key。请在「设置 → 全局翻译」里填入，或把翻译通道换成「谷歌翻译」。';
+    }
+    if (/401|Unauthorized|invalid_api_key/i.test(raw)) {
+      return '翻译失败：API Key 无效或已过期，请检查「设置 → 全局翻译」。';
+    }
+    if (/402|Insufficient|余额|quota|额度/i.test(raw)) {
+      return '翻译失败：接口额度不足或余额用尽。';
+    }
+    if (/abort|timeout|ETIMEDOUT|ENOTFOUND|fetch failed|网络/i.test(raw)) {
+      return '翻译失败：网络连不上翻译服务，请检查代理或换一个翻译通道。';
+    }
+    if (/429|Too Many|限流/i.test(raw)) {
+      return '翻译失败：请求太频繁被限流，稍等几秒再试。';
+    }
+    return `翻译失败：${raw}`;
+  }
+
+  function isSendEnter(event) {
+    if (isDualMode()) return false;
+    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return false;
+    if (state.settings.enterSendMode === 'ctrlEnter') return event.ctrlKey || event.metaKey;
+    return !event.ctrlKey && !event.metaKey;
+  }
+
   function onDocumentKeydown(event) {
     try {
       // 编辑消息模式走独立的 onEditKeydown，避免与普通发送拦截互相干扰
       if (isEditingMode()) return;
       if (isDualMode() || isTranslatingAndSending) return;
-      if (!shouldInterceptEnter(event)) return;
+      // 只关心「这一次回车就是发送」
+      if (!isSendEnter(event)) return;
       const compose = findActiveCompose(event);
       if (!compose) return;
       const source = getComposeText(compose);
       if (!source) return;
+      // 禁止发送中文（默认开启）：含中文一律不许原生发送出去
+      if (mustBlockChinese(source)) {
+        handleBlockedChinese(event, compose, source);
+        return;
+      }
+      // 不翻译时保持原样，让 WhatsApp 自己发送
+      if (state.settings.translateOutgoing === false) return;
+      // 非 ctrl+回车模式只拦截中文，避免影响用户直接发送外文
       if (state.settings.enterSendMode !== 'ctrlEnter' && !HAS_CHINESE.test(source)) return;
       // 彻底阻断原生发送：在进入异步翻译前立即拦截，阻止 WhatsApp 的 React 处理器收到此事件
       event.preventDefault();
@@ -491,6 +660,8 @@ try {
     if (isTranslatingAndSending) return;
     isTranslatingAndSending = true;
     const original = source;
+    // 给用户即时反馈，避免「按了回车没反应」的错觉
+    showToast('正在翻译…', 'ok');
     try {
       // 不再把“翻译中…”写入原输入框，输入框保留原文，仅靠锁阻止重复发送
       const translated = await requestTranslate(original, 'out');
@@ -499,6 +670,7 @@ try {
     } catch (error) {
       console.error('[Preload-WhatsApp] 拦截翻译失败', error);
       setComposeText(compose, original);
+      showToast(describeTranslateError(error));
     } finally {
       // 发送彻底完成后延迟释放锁，避免残留事件再次触发发送
       setTimeout(() => {
@@ -518,7 +690,6 @@ try {
       // 兜底：阻止用户直接点击“发送”按钮把中文发出去
       if (isEditingMode()) return;
       if (isDualMode() || isTranslatingAndSending) return;
-      if (state.settings.translateOutgoing === false) return;
       const target = event.target;
       if (!(target instanceof Element)) return;
       const btn = target.closest?.('button');
@@ -527,6 +698,12 @@ try {
       if (!compose) return;
       const source = getComposeText(compose);
       if (!source) return;
+      // 禁止发送中文（默认开启）：点发送按钮同样拦下
+      if (mustBlockChinese(source)) {
+        handleBlockedChinese(event, compose, source);
+        return;
+      }
+      if (state.settings.translateOutgoing === false) return;
       if (!HAS_CHINESE.test(source)) return;
       event.preventDefault();
       event.stopPropagation();
@@ -908,14 +1085,7 @@ try {
   function extractMessageText(node) {
     const clone = node.cloneNode(true);
     clone.querySelectorAll(`.${CONTAINER_CLASS}`).forEach((el) => el.remove());
-    const textNode = qsFirst(clone, [
-      '[data-testid="conversation-text"]',
-      'span[data-testid="text-content"]',
-      '[data-testid="msg-text"]',
-      'span[dir="ltr"]',
-      'span[dir="rtl"]',
-      'span[dir="auto"]',
-    ]);
+    const textNode = qsFirst(clone, MESSAGE_TEXT_SELECTORS);
     return (textNode?.innerText || textNode?.textContent || '').replace(/\u200b/g, '').trim();
   }
 
@@ -1000,10 +1170,11 @@ try {
       event.stopPropagation();
       void refreshBubble(node, host);
     });
-    const textRoot =
-      qsFirst(node, ['[data-testid="conversation-text"]', '[data-testid="msg-text"]', 'span[dir="ltr"]', 'span[dir="rtl"]']) ||
-      node;
-    textRoot.parentElement ? textRoot.parentElement.appendChild(host) : node.appendChild(host);
+    const textRoot = qsFirst(node, MESSAGE_TEXT_SELECTORS);
+    // 气泡必须挂在消息行内部：拿不到正文节点时退回行本身，
+    // 绝不挂到行外面（否则会变成「整行下方一条」且无法被去重判断识别）
+    const inner = textRoot && textRoot.parentElement && node.contains(textRoot.parentElement) ? textRoot.parentElement : node;
+    inner.appendChild(host);
     return host;
   }
 
@@ -1030,6 +1201,43 @@ try {
     });
     state.bootstrapped = true;
     console.log('[Preload-WhatsApp] 历史快照', state.historyIds.size);
+  }
+
+  // 一次批量刷新历史译文的上限：WhatsApp 打开一个对话通常只加载几十条，
+  // 这个上限足够覆盖整屏+一屏缓冲，又不会因为超长列表一次性打爆翻译接口。
+  const HISTORY_SWEEP_LIMIT = 80;
+  let sweepTimer = null;
+
+  /**
+   * 历史翻译增强：
+   * 打开/切换对话时，把当前已经加载出来的历史消息一次性丢进翻译队列。
+   * - 以前翻译过的消息会直接命中主进程缓存 → 秒出译文，不用等滚动；
+   * - 没翻译过的消息顺手补上，用户点开对话就能看到整屏历史译文。
+   * 之后新滚出来的消息仍由 IntersectionObserver 兜底，两条路互不冲突。
+   */
+  function sweepHistoryTranslations(panel) {
+    if (sweepTimer) window.clearTimeout(sweepTimer);
+    const runSweep = (tag) => {
+      if (state.destroyed) return;
+      try {
+        const nodes = listMessageNodes(panel);
+        const batch = nodes.slice(-HISTORY_SWEEP_LIMIT);
+        batch.forEach((node) => enqueueBubble(node));
+        console.log('[Preload-WhatsApp] 历史译文批量入队', {
+          pass: tag,
+          total: nodes.length,
+          queued: batch.length,
+        });
+      } catch (error) {
+        console.error('[Preload-WhatsApp] 历史译文批量入队失败', error);
+      }
+    };
+    // 第一遍：对话刚渲染出来立刻补译文；第二遍：等 WhatsApp 把剩余消息补齐再兜一次
+    sweepTimer = window.setTimeout(() => {
+      sweepTimer = null;
+      runSweep(1);
+      window.setTimeout(() => runSweep(2), 1200);
+    }, 320);
   }
 
   const MAX_IPC = 2;
@@ -1096,7 +1304,8 @@ try {
       });
     } catch (error) {
       console.error('[Preload-WhatsApp] 气泡翻译失败', error);
-      setBubbleText(host, error.message || '翻译失败', false);
+      // 把失败原因写在气泡里，用户一眼能看到是「没填密钥」还是「网络不通」
+      setBubbleText(host, describeTranslateError(error), false);
     }
   }
 
@@ -1153,6 +1362,7 @@ try {
 
   function onMessagesMutated(mutations, panel) {
     try {
+      const addedRows = [];
       mutations.forEach((mutation) => {
         mutation.addedNodes.forEach((node) => {
           if (!(node instanceof Element)) return;
@@ -1165,45 +1375,61 @@ try {
             const rowsNow = listMessageNodes(panel);
             const index = rowsNow.indexOf(row);
             const appendedBottom = index >= rowsNow.length - 2;
-            if (state.bootstrapped && appendedBottom) {
-              /* 底部实时消息 */
-            } else {
+            if (!(state.bootstrapped && appendedBottom)) {
+              // 插到顶部的都是「更早的历史消息」
               state.historyIds.add(id);
             }
             observeBubble(row);
+            addedRows.push(row);
           });
         });
       });
+      // 用户点「点击此处以获取手机上较早的消息」后，WhatsApp 会把更早的历史插到顶部。
+      // 这些消息不在可视区域内，IntersectionObserver 不会触发，必须主动补翻，
+      // 否则用户向上翻记录时看到的一直是没译文的历史消息。
+      if (addedRows.length) {
+        addedRows.slice(-HISTORY_SWEEP_LIMIT).forEach((row) => enqueueBubble(row));
+        console.log('[Preload-WhatsApp] 补翻新加载的消息', addedRows.length);
+      }
     } catch (error) {
       console.error('[Preload-WhatsApp] 消息 Mutation 处理失败', error);
     }
   }
 
+  /**
+   * 计算「当前对话」的标识：优先真实号码，没有号码时退回对话标题。
+   * 以前只用号码，遇到「存了名字的联系人」时 key 为空 → 既不重置历史快照、
+   * 也不触发批量补翻，历史消息就永远没有译文。
+   */
+  function currentConversationKey(info) {
+    return String(info?.chatId || info?.chatTitle || '').trim();
+  }
+
   function attachMessagePipeline() {
     const panel = findMessagePanel();
-    const convo = getConversationInfo().chatId;
+    const info = getConversationInfo();
+    const convo = currentConversationKey(info);
     reportActiveChat();
     if (!panel) return;
-    if (convo && convo !== state.convoKey) {
-      state.convoKey = convo;
-      state.bootstrapped = false;
-      state.historyIds = new Set();
-      if (state.msgObserver) {
-        state.msgObserver.disconnect();
-        state.msgObserver = null;
-      }
-      snapshotHistory(panel);
-      bindIntersection(panel);
-      state.msgObserver = new MutationObserver((mutations) => onMessagesMutated(mutations, panel));
-      state.msgObserver.observe(panel, { childList: true, subtree: true });
-      return;
+
+    const convoChanged = !!convo && convo !== state.convoKey;
+    // WhatsApp 重渲染时整个消息容器可能被换掉，观察器要跟着换新节点
+    const panelChanged = state.observedPanel !== panel;
+    if (!convoChanged && !panelChanged && state.msgObserver) return;
+
+    if (convoChanged) state.convoKey = convo;
+    state.bootstrapped = false;
+    state.historyIds = new Set();
+    if (state.msgObserver) {
+      state.msgObserver.disconnect();
+      state.msgObserver = null;
     }
-    if (!state.msgObserver) {
-      snapshotHistory(panel);
-      bindIntersection(panel);
-      state.msgObserver = new MutationObserver((mutations) => onMessagesMutated(mutations, panel));
-      state.msgObserver.observe(panel, { childList: true, subtree: true });
-    }
+    state.observedPanel = panel;
+    snapshotHistory(panel);
+    bindIntersection(panel);
+    sweepHistoryTranslations(panel);
+    state.msgObserver = new MutationObserver((mutations) => onMessagesMutated(mutations, panel));
+    state.msgObserver.observe(panel, { childList: true, subtree: true });
   }
 
   function detectLoginState() {
@@ -1233,8 +1459,45 @@ try {
         ipcRenderer.send('wa:login-state', { loggedIn });
         console.log('[Preload-WhatsApp] 登录状态', loggedIn);
       }
+      reportSelfAccount();
     } catch (error) {
       console.error('[Preload-WhatsApp] 上报登录状态失败', error);
+    }
+  }
+
+  // 读取「本账号自己的号码」：只认 WhatsApp 自己写在 localStorage 里的登录 Wid，
+  // 不去猜 DOM，避免把联系人号码误当成账号。
+  function readSelfPhone() {
+    try {
+      const keys = ['last-wid-md', 'last-wid', 'WAWebUserPrefsMeUser'];
+      for (const key of keys) {
+        let raw = null;
+        try {
+          raw = window.localStorage.getItem(key);
+        } catch (error) {
+          raw = null;
+        }
+        if (!raw) continue;
+        const withAt = String(raw).match(/(\d{6,15})@/);
+        if (withAt) return withAt[1];
+        const bare = String(raw).match(/^"?(\d{6,15})"?$/);
+        if (bare) return bare[1];
+      }
+    } catch (error) {
+      console.error('[Preload-WhatsApp] 读取本账号号码失败', error);
+    }
+    return '';
+  }
+
+  function reportSelfAccount() {
+    try {
+      const phone = readSelfPhone();
+      if (!phone || phone === state.selfPhone) return;
+      state.selfPhone = phone;
+      ipcRenderer.send('wa:self-account', { phone });
+      console.log('[Preload-WhatsApp] 本账号号码', phone);
+    } catch (error) {
+      console.error('[Preload-WhatsApp] 上报本账号号码失败', error);
     }
   }
 

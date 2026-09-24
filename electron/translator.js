@@ -4,12 +4,18 @@ function langName(code) {
   return LANG_LABELS[code] || code || '目标语';
 }
 
+/** 发出翻译的目标语言：outgoingLang 优先，兼容旧的 sourceLang */
+function outgoingLangCode(settings = {}) {
+  const direct = String(settings.outgoingLang || '').trim();
+  if (direct && direct !== 'auto') return direct;
+  const legacy = String(settings.sourceLang || '').trim();
+  if (legacy && legacy !== 'auto') return legacy;
+  return 'he';
+}
+
 function buildPrompt({ text, direction, settings, rolePrompt }) {
   const inLang = langName(settings.targetLang || 'zh-CN');
-  const outLang =
-    settings.sourceLang && settings.sourceLang !== 'auto'
-      ? langName(settings.sourceLang)
-      : '客户常用语（优先现代希伯来语，除非角色另有说明）';
+  const outLang = langName(outgoingLangCode(settings));
 
   const task =
     direction === 'in'
@@ -55,7 +61,7 @@ async function translateGoogle(ses, text, direction, settings) {
   const tl =
     direction === 'in'
       ? googleLang(settings.targetLang || 'zh-CN')
-      : googleLang(settings.sourceLang === 'auto' ? 'he' : settings.sourceLang);
+      : googleLang(outgoingLangCode(settings));
   const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${encodeURIComponent(
     sl,
   )}&tl=${encodeURIComponent(tl)}&dt=t&q=${encodeURIComponent(text)}`;
@@ -144,4 +150,4 @@ async function translateText({ ses, text, direction, settings, rolePrompt, chann
   });
 }
 
-module.exports = { translateText, langName };
+module.exports = { translateText, langName, outgoingLangCode };

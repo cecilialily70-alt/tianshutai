@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Sidebar from './components/Sidebar.jsx';
 import TabBar from './components/TabBar.jsx';
 import EnvConfigDrawer from './components/EnvConfigDrawer.jsx';
+import EnvTranslateModal from './components/EnvTranslateModal.jsx';
 import ZoomPanel from './components/ZoomPanel.jsx';
 import PerChatConfigPanel from './components/PerChatConfigPanel.jsx';
 import InboxPage from './pages/InboxPage.jsx';
@@ -27,13 +28,14 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const [envTabId, setEnvTabId] = useState(null);
   const [zoomTabId, setZoomTabId] = useState(null);
+  const [envTranslateTabId, setEnvTranslateTabId] = useState(null);
   const [renameSignal, setRenameSignal] = useState({ tabId: null, n: 0 });
   const [sidebarWidth, setSidebarWidth] = useState(300);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const prevSidebarWidth = useRef(300);
   const persistTimer = useRef(null);
   const browserRef = useRef(null);
-  const overlayOpen = Boolean(envTabId || zoomTabId);
+  const overlayOpen = Boolean(envTabId || zoomTabId || envTranslateTabId);
 
   const persist = useCallback((nextTabs, nextActiveId) => {
     if (!window.shellAPI?.tabs) return;
@@ -96,6 +98,19 @@ export default function App() {
   useEffect(() => {
     const unsub = window.shellAPI?.tabs?.onName?.(({ tabId, name }) => {
       setTabs((prev) => prev.map((tab) => (tab.id === tabId ? { ...tab, name } : tab)));
+    });
+    return () => {
+      unsub?.();
+    };
+  }, []);
+
+  // 注入脚本探测到本账号号码后同步到标签，用于右侧面板显示「所属账户」
+  useEffect(() => {
+    const unsub = window.shellAPI?.tabs?.onSelfPhone?.(({ tabId, selfPhone }) => {
+      if (!tabId) return;
+      setTabs((prev) =>
+        prev.map((tab) => (tab.id === tabId ? { ...tab, selfPhone } : tab)),
+      );
     });
     return () => {
       unsub?.();
@@ -187,9 +202,10 @@ export default function App() {
       }
       if (envTabId === tabId) setEnvTabId(null);
       if (zoomTabId === tabId) setZoomTabId(null);
+      if (envTranslateTabId === tabId) setEnvTranslateTabId(null);
       commitState(next, nextActive);
     },
-    [tabs, activeTabId, envTabId, zoomTabId, commitState],
+    [tabs, activeTabId, envTabId, zoomTabId, envTranslateTabId, commitState],
   );
 
   const handleRenameTab = useCallback(
@@ -233,13 +249,23 @@ export default function App() {
       if (action === 'env') {
         window.shellAPI?.overlay?.setOpen(true);
         setZoomTabId(null);
+        setEnvTranslateTabId(null);
         setEnvTabId(tab.id);
         return;
       }
       if (action === 'zoom') {
         window.shellAPI?.overlay?.setOpen(true);
         setEnvTabId(null);
+        setEnvTranslateTabId(null);
         setZoomTabId(tab.id);
+        return;
+      }
+      if (action === 'envTranslate') {
+        // 独立翻译设置：弹窗里配置「这个环境（这个标签/账号）所有对话」的翻译默认值
+        window.shellAPI?.overlay?.setOpen(true);
+        setEnvTabId(null);
+        setZoomTabId(null);
+        setEnvTranslateTabId(tab.id);
         return;
       }
       if (action === 'chat') {
@@ -303,6 +329,7 @@ export default function App() {
 
   const envTab = tabs.find((tab) => tab.id === envTabId) || null;
   const zoomTab = tabs.find((tab) => tab.id === zoomTabId) || null;
+  const envTranslateTab = tabs.find((tab) => tab.id === envTranslateTabId) || null;
 
   const handleToggleSidebar = useCallback(() => {
     setSidebarCollapsed((prev) => {
@@ -371,6 +398,9 @@ export default function App() {
           )}
           {envTab && (
             <EnvConfigDrawer tab={envTab} onClose={() => setEnvTabId(null)} onSave={handleEnvSave} />
+          )}
+          {envTranslateTab && (
+            <EnvTranslateModal tab={envTranslateTab} onClose={() => setEnvTranslateTabId(null)} />
           )}
           {zoomTab && (
             <ZoomPanel tab={zoomTab} onClose={() => setZoomTabId(null)} onChange={handleZoomChange} />

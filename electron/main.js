@@ -1,6 +1,14 @@
-const { app, BrowserWindow, BrowserView, session, ipcMain, Menu } = require('electron');
+const { app, BrowserWindow, BrowserView, session, ipcMain, Menu, shell, clipboard } = require('electron');
 const path = require('path');
 const Store = require('electron-store');
+
+// 单实例锁：禁止同时启动两个天枢台，避免两个进程抢同一份账户数据/缓存
+// 必须在 app ready 之前申请；拿不到锁说明已有实例在跑，直接退出本次启动。
+if (!app.requestSingleInstanceLock()) {
+  console.log('[Main] 检测到天枢台已在运行，本次启动自动退出');
+  app.quit();
+  process.exit(0);
+}
 
 // 反检测：禁用 WebRTC 本地 IP 枚举（配合 stealth-preload.js 的 JS 层兜底）
 // 必须在 app.ready 之前设置才生效
@@ -20,6 +28,9 @@ const {
   normalizeRole,
   LANG_LABELS,
   CHANNEL_LABELS,
+  mergeTranslationLayer,
+  applyTranslationLayer,
+  ENV_TRANSLATION_KEYS,
 } = require('./translation');
 const { translateText } = require('./translator');
 const { createTranslateCache } = require('./translateCache');
@@ -140,6 +151,17 @@ function ensureTabs() {
     activeTabId = tabs[0]?.id || null;
     store.set('activeTabId', activeTabId);
   } else {
+    // 一次性迁移：旧版本会把标签自动改成「当前对话对方的手机号」，
+    // 新版本标签名完全由用户自定义（如 WHats1 / WHats2），这里把遗留的纯号码名还原成「账户 N」。
+    // 用标记位保证只跑一次，之后用户若真的想用纯数字当名字也不会被改掉。
+    if (!store.get('peerNameMigrated')) {
+      tabs = tabs.map((tab, index) => {
+        const name = String(tab.name || '').trim();
+        if (!/^\+?\d{6,}$/.test(name)) return tab;
+        return { ...tab, name: `账户 ${index + 1}` };
+      });
+      store.set('peerNameMigrated', true);
+    }
     store.set('tabs', tabs);
   }
   if (!tabs.some((tab) => tab.id === activeTabId)) {
@@ -160,44 +182,60 @@ function patchTab(tabId, patch) {
   return next.find((tab) => tab.id === tabId) || null;
 }
 
-// 将标签重命名为当前对话对象（对方）的手机号
-function renameTabToPeer(tabId, phoneOrId) {
+// 标签名完全由用户自定义（右键 → 重命名），不再自动改成对话对方的手机号：
+// 否则标签会随着「当前打开的对话」不断变化，用户无法用它记住是哪个账号。
+// 账号自己的号码由 wa:self-account 单独上报，展示在右侧面板的「账户」里。
+function reportSelfPhone(tabId, phone) {
   try {
-    const digits = String(phoneOrId || '').replace(/\D/g, '');
-    if (digits.length < 6) return; // 群组/无效标识不重命名
+    const digits = String(phone || '').replace(/\D/g, '');
+    if (digits.length < 6) return;
+    const value = `+${digits}`;
     const tab = getTab(tabId);
-    if (!tab) return;
-    const current = (tab.name || '').trim();
-    // 仅当仍为自动生成的“账户 N”或已是手机号时才替换，避免覆盖用户手动命名
-    const isAuto = !current || /^账户\s*\d*$/.test(current) || /^\+?\d{6,}$/.test(current);
-    if (!isAuto) return;
-    const name = `+${digits}`;
-    if (current === name) return;
-    patchTab(tabId, { name });
+    if (!tab || tab.selfPhone === value) return;
+    patchTab(tabId, { selfPhone: value });
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('tabs:name', { tabId, name });
+      mainWindow.webContents.send('tabs:self-phone', { tabId, selfPhone: value });
     }
-    console.log('[Main] 标签重命名为对方号码', { tabId: tabId.slice(0, 8), name });
+    console.log('[Main] 已记录本账号号码', { tabId: tabId.slice(0, 8), selfPhone: value });
   } catch (error) {
-    console.error('[Main] 重命名标签失败', error);
+    console.error('[Main] 记录本账号号码失败', error);
   }
+}
+
+/**
+ * 三层翻译配置，越具体越优先：
+ *   对话（右侧「独立翻译设置」，按对话保存差异）
+ *     > 环境（右键「独立翻译设置」弹窗，按标签/账号保存差异）
+ *       > 全局（设置页里的全局翻译设置）
+ * 环境与对话都只保存「用户显式改过」的字段，没改过的自动跟随上一级，
+ * 所以改环境默认值时，没被单独调过的对话会立刻跟着生效。
+ */
+function getEnvTranslation(accountId) {
+  if (!accountId) return {};
+  const all = store.get('envTranslations') || {};
+  const layer = all[String(accountId)];
+  return layer && typeof layer === 'object' ? layer : {};
+}
+
+function setEnvTranslation(accountId, layer) {
+  const all = { ...(store.get('envTranslations') || {}) };
+  const key = String(accountId || '');
+  if (!key) return;
+  const next = mergeTranslationLayer(all[key] || {}, layer);
+  if (Object.keys(next).length === 0) delete all[key];
+  else all[key] = next;
+  store.set('envTranslations', all);
 }
 
 function getEffectiveTranslation(accountId, chatId) {
   const global = normalizeTranslation(store.get('translation') || {});
-  if (!accountId || !chatId || !chatConfigStore) return global;
+  // ① 全局 → ② 环境
+  const withEnv = applyTranslationLayer(global, getEnvTranslation(accountId));
+  if (!accountId || !chatId || !chatConfigStore) return withEnv;
+  // ③ 环境 → 对话
   const perChat = chatConfigStore.get(accountId, chatId);
-  if (!perChat) return global;
-  // 存在独立配置则覆盖全局配置，缺失字段回退全局
-  return {
-    ...global,
-    channel: perChat.channel || global.channel,
-    roleId: perChat.roleId ?? global.roleId,
-    translateOutgoing: perChat.translateOutgoing ?? global.translateOutgoing,
-    translateIncoming: perChat.translateIncoming ?? global.translateIncoming,
-    sourceLang: perChat.sourceLang || global.sourceLang,
-    targetLang: perChat.targetLang || global.targetLang,
-  };
+  if (!perChat) return withEnv;
+  return applyTranslationLayer(withEnv, perChat);
 }
 
 function getBridgePayload(tab, chatId) {
@@ -211,14 +249,15 @@ function getBridgePayload(tab, chatId) {
     translateOutgoing: translation.translateOutgoing,
     translateIncoming: translation.translateIncoming,
     sourceLang: translation.sourceLang,
+    outgoingLang: translation.outgoingLang,
     targetLang: translation.targetLang,
     channel: translation.channel,
     channelLabel: CHANNEL_LABELS[translation.channel] || 'GPT',
-    outgoingLangLabel:
-      translation.sourceLang && translation.sourceLang !== 'auto'
-        ? LANG_LABELS[translation.sourceLang] || translation.sourceLang
-        : LANG_LABELS.he,
+    // 发出翻译的目标语言（发给客户的语言）
+    outgoingLangLabel: LANG_LABELS[translation.outgoingLang] || LANG_LABELS.he,
     incomingLangLabel: LANG_LABELS[translation.targetLang] || '中文',
+    // 禁止发送中文（默认开启）：打开后任何含中文的内容都不允许发出去
+    blockChinese: translation.blockChinese !== false,
     roleTitle: role?.title || '',
   };
 }
@@ -378,31 +417,38 @@ async function handleTranslateMsg(event, payload = {}) {
     // 保证历史消息「必然出译文」并被缓存，避免再次打开时历史翻译缺失。
     let translated = '';
     let usedChannel = channelOverride;
-    try {
-      translated = await translateText({
+    const premium = settings.channel || 'deepseek';
+    // 付费渠道没填 Key 时就不要白跑一趟（以前会一路失败到底，历史全是「翻译失败」）
+    const premiumReady = premium === 'google' || !!String(settings.apiKey || '').trim();
+
+    const runChannel = (channel) =>
+      translateText({
         ses,
         text,
         direction,
         settings,
         rolePrompt: role?.prompt || '',
-        channelOverride,
+        channelOverride: channel,
       });
+
+    try {
+      translated = await runChannel(channelOverride);
     } catch (error) {
-      const premium = settings.channel || 'deepseek';
-      if (channelOverride === 'google' && premium !== 'google') {
+      if (channelOverride === 'google' && premium !== 'google' && premiumReady) {
         console.warn('[Main] 谷歌翻译失败，回退付费渠道', {
           error: error.message || error,
           fallback: premium,
         });
         usedChannel = premium;
-        translated = await translateText({
-          ses,
-          text,
-          direction,
-          settings,
-          rolePrompt: role?.prompt || '',
-          channelOverride: premium,
+        translated = await runChannel(premium);
+      } else if (channelOverride === 'google' && premium !== 'google') {
+        // 付费渠道没配 Key：重试一次谷歌（多数是瞬时失败/限流），而不是直接判死刑
+        console.warn('[Main] 谷歌翻译失败且付费渠道未配置 Key，重试谷歌', {
+          error: error.message || error,
         });
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        usedChannel = 'google';
+        translated = await runChannel('google');
       } else {
         throw error;
       }
@@ -441,9 +487,10 @@ function showTabContextMenu(win, tabId) {
   const tab = getTab(tabId);
   if (!tab) return;
   const template = [
-    { label: '编辑', click: () => sendTabAction(win, tabId, 'edit') },
+    { label: '备注', click: () => sendTabAction(win, tabId, 'edit') },
     { label: '环境配置', click: () => sendTabAction(win, tabId, 'env') },
-    { label: '独立翻译设置', click: () => sendTabAction(win, tabId, 'chat') },
+    // 打开弹窗，配置「这个环境（这个标签/账号）所有对话」的翻译默认值
+    { label: '独立翻译设置', click: () => sendTabAction(win, tabId, 'envTranslate') },
     { label: '缩放页面', click: () => sendTabAction(win, tabId, 'zoom') },
     { type: 'separator' },
     {
@@ -1154,6 +1201,13 @@ function bindIpc() {
     emitStatus(tabId, payload?.loggedIn ? 'online' : 'offline');
   });
 
+  // 注入脚本探测到「本账号自己的号码」后上报，用于右侧面板显示所属账户
+  ipcMain.on('wa:self-account', (event, payload) => {
+    const tabId = findTabIdByWebContents(event.sender);
+    if (!tabId) return;
+    reportSelfPhone(tabId, payload?.phone);
+  });
+
   ipcMain.on('chat:active', (event, payload) => {
     const tabId = findTabIdByWebContents(event.sender);
     if (!tabId) return;
@@ -1163,7 +1217,6 @@ function bindIpc() {
     const prev = activeChatMap.get(tabId);
     if (prev?.chatId === chatId && prev?.chatTitle === chatTitle) return;
     activeChatMap.set(tabId, { chatId, chatTitle });
-    renameTabToPeer(tabId, chatId);
     const tab = getTab(tabId);
     const view = viewMap.get(tabId);
     if (tab && view && !view.webContents.isDestroyed()) {
@@ -1186,7 +1239,6 @@ function bindIpc() {
     const prev = activeChatMap.get(tabId);
     if (prev?.chatId === chatId && prev?.chatTitle === chatTitle) return;
     activeChatMap.set(tabId, { chatId, chatTitle });
-    renameTabToPeer(tabId, chatId);
     const tab = getTab(tabId);
     const view = viewMap.get(tabId);
     if (tab && view && !view.webContents.isDestroyed()) {
@@ -1204,37 +1256,96 @@ function bindIpc() {
     const chatId = String(payload?.chatId || '');
     const global = normalizeTranslation(store.get('translation') || {});
     const roles = store.get('roles') || [];
+    const env = getEnvTranslation(accountId);
     const perChat = accountId && chatId ? chatConfigStore?.get(accountId, chatId) : null;
-    return { accountId, chatId, global, roles, perChat };
+    // 右侧面板需要知道「环境默认值」才能判断哪些字段是用户自己改过的差异
+    const envDefaults = applyTranslationLayer(global, env);
+    return { accountId, chatId, global, env, envDefaults, roles, perChat };
   });
 
+  // 对话级：补丁式保存，只写入用户实际改过的字段，其余跟随环境/全局
   ipcMain.handle('chat-config:save', (_event, payload) => {
     const accountId = String(payload?.accountId || '');
     const chatId = String(payload?.chatId || '');
     if (!accountId || !chatId) return { ok: false, error: '缺少账户或对话标识' };
-    const config = {
-      channel: payload?.channel || '',
-      roleId: payload?.roleId || '',
-      translateOutgoing: payload?.translateOutgoing !== false,
-      translateIncoming: payload?.translateIncoming !== false,
-      sourceLang: payload?.sourceLang || 'auto',
-      targetLang: payload?.targetLang || 'zh-CN',
-      nickname: String(payload?.nickname || '').trim(),
-      remark: String(payload?.remark || '').trim(),
+    const patch = {};
+    const assign = (key) => {
+      if (payload && Object.prototype.hasOwnProperty.call(payload, key)) patch[key] = payload[key];
     };
-    chatConfigStore?.set(accountId, chatId, config);
-    console.log('[Main] 已保存独立翻译配置', { accountId, chatId: chatId.slice(0, 24), nickname: config.nickname, remark: config.remark });
+    ['channel', 'roleId', 'translateOutgoing', 'translateIncoming', 'outgoingLang', 'targetLang', 'blockChinese', 'nickname', 'remark'].forEach(
+      assign,
+    );
+    chatConfigStore?.set(accountId, chatId, patch);
+    console.log('[Main] 已保存对话独立配置', {
+      accountId,
+      chatId: chatId.slice(0, 24),
+      fields: Object.keys(patch),
+    });
     broadcastWaSettings();
-    return { ok: true, config };
+    return { ok: true, config: chatConfigStore?.get(accountId, chatId) || null };
+  });
+
+  // 恢复「环境默认」：只清掉对话级的翻译覆盖，保留昵称/备注
+  ipcMain.handle('chat-config:reset-translate', (_event, payload) => {
+    const accountId = String(payload?.accountId || '');
+    const chatId = String(payload?.chatId || '');
+    if (!accountId || !chatId) return { ok: false, error: '缺少账户或对话标识' };
+    chatConfigStore?.resetTranslate(accountId, chatId);
+    console.log('[Main] 已恢复环境默认翻译', { accountId, chatId: chatId.slice(0, 24) });
+    broadcastWaSettings();
+    return { ok: true, config: chatConfigStore?.get(accountId, chatId) || null };
   });
 
   ipcMain.handle('chat-config:remove', (_event, payload) => {
     const accountId = String(payload?.accountId || '');
     const chatId = String(payload?.chatId || '');
     chatConfigStore?.remove(accountId, chatId);
-    console.log('[Main] 已恢复全局翻译配置', { accountId, chatId: chatId.slice(0, 24) });
+    console.log('[Main] 已删除对话独立配置', { accountId, chatId: chatId.slice(0, 24) });
     broadcastWaSettings();
     return { ok: true };
+  });
+
+  // ---------- 环境级「独立翻译设置」（右键标签 → 独立翻译设置） ----------
+  ipcMain.handle('env-translation:get', (_event, payload) => {
+    const accountId = String(payload?.accountId || '');
+    const tab = getTab(String(payload?.tabId || '')) || null;
+    const global = normalizeTranslation(store.get('translation') || {});
+    const env = getEnvTranslation(accountId);
+    return {
+      accountId,
+      env,
+      global,
+      // 面板上「跟随全局」的开关状态由此推导
+      hasEnvOverride: Object.keys(env).length > 0,
+      roles: ensureRoles(),
+      tabName: tab?.name || '',
+    };
+  });
+
+  ipcMain.handle('env-translation:save', (_event, payload) => {
+    const accountId = String(payload?.accountId || '');
+    if (!accountId) return { ok: false, error: '缺少账户标识' };
+    const patch = {};
+    ENV_TRANSLATION_KEYS.forEach((key) => {
+      if (payload?.patch && Object.prototype.hasOwnProperty.call(payload.patch, key)) {
+        patch[key] = payload.patch[key];
+      }
+    });
+    setEnvTranslation(accountId, patch);
+    console.log('[Main] 已保存环境独立翻译设置', { accountId, fields: Object.keys(patch) });
+    broadcastWaSettings();
+    return { ok: true, env: getEnvTranslation(accountId) };
+  });
+
+  ipcMain.handle('env-translation:reset', (_event, payload) => {
+    const accountId = String(payload?.accountId || '');
+    if (!accountId) return { ok: false, error: '缺少账户标识' };
+    const all = { ...(store.get('envTranslations') || {}) };
+    delete all[accountId];
+    store.set('envTranslations', all);
+    console.log('[Main] 已清空环境独立翻译设置', { accountId });
+    broadcastWaSettings();
+    return { ok: true, env: {} };
   });
 
   ipcMain.handle('translate:run', (event, payload) =>
@@ -1324,7 +1435,44 @@ function bindIpc() {
   ipcMain.on('window:close', (event) => {
     BrowserWindow.fromWebContents(event.sender)?.close();
   });
+
+  // 作者/支持入口：只允许打开 Telegram 链接，避免任意 URL 被外部打开
+  ipcMain.handle('app:open-external', async (_event, url) => {
+    const target = String(url || '').trim();
+    if (!/^https:\/\/t\.me\//i.test(target)) {
+      return { ok: false, error: '不支持的链接' };
+    }
+    try {
+      await shell.openExternal(target);
+      return { ok: true };
+    } catch (error) {
+      console.error('[Main] 打开外部链接失败', error.message || error);
+      return { ok: false, error: error.message || '打开失败' };
+    }
+  });
+
+  // 复制文本到系统剪贴板（渲染进程里 navigator.clipboard 在 file:// 下不稳定）
+  ipcMain.handle('clipboard:write-text', (_event, text) => {
+    try {
+      clipboard.writeText(String(text ?? ''));
+      return { ok: true };
+    } catch (error) {
+      console.error('[Main] 写入剪贴板失败', error.message || error);
+      return { ok: false, error: error.message || '复制失败' };
+    }
+  });
 }
+
+// 第二个实例被启动时，把已有窗口拉到前台（配合单实例锁）
+app.on('second-instance', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
 
 app.whenReady().then(() => {
   console.log('[Main] 应用就绪');
@@ -1332,9 +1480,36 @@ app.whenReady().then(() => {
   chatConfigStore = createChatConfig(app.getPath('userData'));
   ensureTabs();
   ensureRoles();
+  migrateLegacyChatOverrides();
   bindIpc();
   createMainWindow();
 });
+
+/**
+ * 一次性迁移：老版本的对话级配置是「当时全局配置的整份快照」，
+ * 会把翻译设置永久钉死，导致之后改环境/全局默认值时那些对话不生效。
+ * 这里把与全局默认值相同的字段清成「继承」，真正被单独改过的字段保留。
+ */
+function migrateLegacyChatOverrides() {
+  try {
+    if (store.get('chatOverridesSparseMigrated')) return;
+    const global = normalizeTranslation(store.get('translation') || {});
+    const defaults = {
+      channel: global.channel,
+      roleId: global.roleId,
+      translateOutgoing: global.translateOutgoing,
+      translateIncoming: global.translateIncoming,
+      outgoingLang: global.outgoingLang,
+      targetLang: global.targetLang,
+      blockChinese: global.blockChinese,
+    };
+    const touched = chatConfigStore?.cleanupLegacyOverrides(defaults) || 0;
+    store.set('chatOverridesSparseMigrated', true);
+    console.log('[Main] 对话级配置迁移完成（清理整份快照残留）', { touched });
+  } catch (error) {
+    console.warn('[Main] 对话级配置迁移失败', error.message || error);
+  }
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

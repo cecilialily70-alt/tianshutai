@@ -1,0 +1,48 @@
+# 天枢台 · electron-builder 打包配置
+# 本文件决定「打包.bat」最终产出的 Windows 程序形态。
+
+appId: com.tianshutai.desktop
+productName: 天枢台
+copyright: Copyright © 2026 天枢台
+
+directories:
+  output: release
+  buildResources: build
+
+# 打进安装包的文件（生产依赖 node_modules 由 electron-builder 自动收集）
+files:
+  - electron/**/*
+  - dist/**/*
+  - package.json
+  - '!**/*.map'
+  - '!**/*.md'
+
+asar: true
+compression: normal
+
+# 打包后清理 Electron 默认应用残留（见 build/after-pack.js）
+afterPack: ./build/after-pack.js
+
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 天枢台
+  uninstallDisplayName: 天枢台
+  artifactName: 天枢台-安装版-${version}.${ext}
+
+portable:
+  artifactName: 天枢台-便携版-${version}.${ext}

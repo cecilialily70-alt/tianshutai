@@ -26,6 +26,12 @@ export const LANGUAGES = [
 
 export const ROLE_TYPES = ['翻译', '客服', '智能回复', '自定义'];
 
+// 发出翻译的目标语言：必须是一个确定语言，不能是「自动检测」
+export const OUTGOING_LANGUAGES = LANGUAGES.filter((item) => item.id !== 'auto');
+
+// 接收翻译的目标语言：同理，必须是确定语言
+export const INCOMING_LANGUAGES = LANGUAGES.filter((item) => item.id !== 'auto');
+
 export const ENTER_SEND_MODES = [
   { id: 'enter', label: 'Enter 翻译并发送' },
   { id: 'ctrlEnter', label: 'Ctrl+Enter 发送，Enter 换行' },

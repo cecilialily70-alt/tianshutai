@@ -39,11 +39,13 @@ export default function TabBar({
   }, [renameSignal]);
 
   return (
-    <header className="drag-region flex h-10 shrink-0 items-stretch border-b border-shell-line bg-[#1a242b]">
-      <div className="flex w-14 shrink-0 items-center justify-center text-[11px] font-semibold tracking-wide text-shell-wa">
+    <header className="drag-region flex min-h-10 shrink-0 items-start border-b border-shell-line bg-[#1a242b]">
+      <div className="flex h-10 w-14 shrink-0 items-center justify-center text-[11px] font-semibold tracking-wide text-shell-wa">
         天枢
       </div>
-      <div className="flex min-w-0 flex-1 items-stretch overflow-x-auto">
+      {/* 标签排满时自动换到第二排、第三排，不再横向滚动隐藏；
+          超过 40% 窗口高度后改为内部滚动，避免标签把网页区域挤没 */}
+      <div className="flex max-h-[40vh] min-w-0 flex-1 flex-wrap items-stretch content-start overflow-y-auto">
         {tabs.map((tab) => {
           const active = tab.id === activeTabId;
           return (
@@ -66,7 +68,7 @@ export default function TabBar({
                 setDraggingId(null);
               }}
               onDragEnd={() => setDraggingId(null)}
-              className={`no-drag group relative flex max-w-[220px] min-w-[128px] items-center gap-2 border-r border-shell-line px-3 transition-colors duration-200 ease-shell ${
+              className={`no-drag group relative flex h-10 max-w-[220px] min-w-[128px] items-center gap-2 border-r border-shell-line px-3 transition-colors duration-200 ease-shell ${
                 active ? 'bg-shell-bg text-shell-text' : 'bg-transparent text-shell-muted hover:bg-shell-card'
               } ${draggingId === tab.id ? 'opacity-50' : ''}`}
               onClick={() => onSelect(tab.id)}

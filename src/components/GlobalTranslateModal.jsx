@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import DraggablePanel from './DraggablePanel.jsx';
 import Switch from './ui/Switch.jsx';
 import Field, { DarkInput, DarkSelect } from './ui/Field.jsx';
-import { CHANNELS, ENTER_SEND_MODES, LANGUAGES } from '../lib/translation.js';
+import { CHANNELS, ENTER_SEND_MODES, INCOMING_LANGUAGES, OUTGOING_LANGUAGES } from '../lib/translation.js';
 
 const EMPTY = {
   channel: 'deepseek',
@@ -11,7 +11,7 @@ const EMPTY = {
   roleId: '',
   translateOutgoing: true,
   translateIncoming: true,
-  sourceLang: 'auto',
+  outgoingLang: 'he',
   targetLang: 'zh-CN',
   smartReply: false,
   enterSendMode: 'enter',
@@ -90,6 +90,14 @@ export default function GlobalTranslateModal({ onClose }) {
           </Field>
         </div>
 
+        {(form.channel === 'deepseek' || form.channel === 'openai' || form.channel === 'claude') &&
+          !String(form.apiKey || '').trim() && (
+            <p className="rounded-lg bg-[#7f1d1d]/35 px-3 py-2 text-[11px] leading-5 text-[#fca5a5]">
+              当前通道还没有填 API Key，翻译不会成功（消息会发不出去）。
+              不想填密钥的话，把上面的「翻译通道」直接换成「谷歌翻译」即可，免密钥可用。
+            </p>
+          )}
+
         {(form.channel === 'deepseek' || form.channel === 'openai' || form.channel === 'claude') && (
           <div className="grid grid-cols-1 gap-3">
             <Field label="API Key">
@@ -123,21 +131,27 @@ export default function GlobalTranslateModal({ onClose }) {
           />
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="源语言">
+        <div className="grid grid-cols-1 gap-3">
+          <Field label="发出翻译目标语言">
             <DarkSelect
-              value={form.sourceLang}
-              onChange={(value) => setField('sourceLang', value)}
-              options={LANGUAGES}
+              value={form.outgoingLang || 'he'}
+              onChange={(value) => setField('outgoingLang', value)}
+              options={OUTGOING_LANGUAGES}
             />
           </Field>
-          <Field label="目标语言">
+          <p className="-mt-1 text-[11px] leading-5 text-shell-muted">
+            你写的中文会翻译成这个语言发给客户。
+          </p>
+          <Field label="接收翻译目标语言">
             <DarkSelect
-              value={form.targetLang}
+              value={form.targetLang || 'zh-CN'}
               onChange={(value) => setField('targetLang', value)}
-              options={LANGUAGES.filter((item) => item.id !== 'auto')}
+              options={INCOMING_LANGUAGES}
             />
           </Field>
+          <p className="-mt-1 text-[11px] leading-5 text-shell-muted">
+            客户发来的消息会翻译成这个语言给你看。
+          </p>
         </div>
 
         <Switch

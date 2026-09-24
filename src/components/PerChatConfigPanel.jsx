@@ -1,18 +1,31 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Switch from './ui/Switch.jsx';
 import Field, { DarkInput, DarkSelect } from './ui/Field.jsx';
-import { CHANNELS, LANGUAGES } from '../lib/translation.js';
+import { CHANNELS, INCOMING_LANGUAGES, OUTGOING_LANGUAGES } from '../lib/translation.js';
 
 const EMPTY = {
   channel: 'deepseek',
   roleId: '',
   translateOutgoing: true,
   translateIncoming: true,
-  sourceLang: 'auto',
+  outgoingLang: 'he',
   targetLang: 'zh-CN',
   nickname: '',
   remark: '',
+  // 禁止发送中文：默认打开
+  blockChinese: true,
 };
+
+// 对话级可以单独覆盖的翻译字段（其余字段永远跟随「环境默认」）
+const OVERRIDE_KEYS = [
+  'channel',
+  'roleId',
+  'translateOutgoing',
+  'translateIncoming',
+  'outgoingLang',
+  'targetLang',
+  'blockChinese',
+];
 
 const MIN_WIDTH = 240;
 const MAX_WIDTH = 520;
@@ -27,14 +40,47 @@ export default function PerChatConfigPanel({
   onResizeEnd,
 }) {
   const chatId = chat?.chatId || '';
-  const chatTitle = chat?.chatTitle || '';
   const [form, setForm] = useState(EMPTY);
+  // 「环境默认」基线：没被单独改过的字段显示/保存的就是它
+  const [envDefaults, setEnvDefaults] = useState(null);
   const [roles, setRoles] = useState([]);
   const [perChat, setPerChat] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [hint, setHint] = useState('');
+  const [copied, setCopied] = useState(false);
   const resizeRef = useRef(null);
+  const copyTimer = useRef(null);
+
+  // 对话已经单独改过哪些翻译项（用于提示 + 决定是否显示「恢复环境默认」）
+  const overrideKeys = useMemo(
+    () => OVERRIDE_KEYS.filter((key) => perChat && perChat[key] != null),
+    [perChat],
+  );
+
+  // 对话只展示纯数字号码（WhatsApp 标题常带 + 号、空格、连字符）
+  const displayChatId = chatId.replace(/\D/g, '') || chatId;
+
+  const handleCopyChatId = async () => {
+    if (!displayChatId) return;
+    try {
+      const result = await window.shellAPI?.clipboard?.writeText?.(displayChatId);
+      if (result && result.ok === false) throw new Error(result.error || '复制失败');
+      setCopied(true);
+      window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(false), 1600);
+    } catch (error) {
+      console.error('[Renderer] 复制号码失败', error);
+      setHint('复制失败');
+    }
+  };
+
+  useEffect(
+    () => () => {
+      window.clearTimeout(copyTimer.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -53,9 +99,10 @@ export default function PerChatConfigPanel({
         if (cancelled) return;
         setRoles(data.roles || []);
         setPerChat(data.perChat || null);
+        setEnvDefaults(data.envDefaults || data.global || null);
         setForm({
           ...EMPTY,
-          ...(data.global || {}),
+          ...(data.envDefaults || data.global || {}),
           ...(data.perChat || {}),
         });
       })
@@ -108,11 +155,37 @@ export default function PerChatConfigPanel({
     setHint('');
   };
 
+  /**
+   * 只提交「与环境默认不同」的翻译字段。
+   * 相同且之前单独设置过的，显式传 null 取消覆盖，回到跟随环境默认。
+   * 这样改环境默认值时，没被单独调过的对话会自动跟着变。
+   */
+  const buildPatch = () => {
+    const patch = { nickname: form.nickname || '', remark: form.remark || '' };
+    const base = envDefaults || {};
+    OVERRIDE_KEYS.forEach((key) => {
+      const value = form[key];
+      const baseValue = base[key];
+      const differs =
+        typeof value === 'boolean' || typeof baseValue === 'boolean'
+          ? value !== baseValue
+          : String(value ?? '') !== String(baseValue ?? '');
+      if (differs) patch[key] = value;
+      else if (perChat && perChat[key] != null) patch[key] = null;
+    });
+    return patch;
+  };
+
   const handleSave = async () => {
     setSaving(true);
     try {
-      await window.shellAPI.chatConfig.save({ accountId: tab.accountId, chatId, ...form });
-      setPerChat({ ...form });
+      const result = await window.shellAPI.chatConfig.save({
+        accountId: tab.accountId,
+        chatId,
+        ...buildPatch(),
+      });
+      if (result && result.ok === false) throw new Error(result.error || '保存失败');
+      setPerChat(result?.config || null);
       setHint('已保存到本机');
     } catch (error) {
       console.error('[Renderer] 保存独立配置失败', error);
@@ -122,37 +195,40 @@ export default function PerChatConfigPanel({
     }
   };
 
+  // 恢复「环境默认」：只清掉本对话的翻译覆盖，昵称/备注保留
   const handleReset = async () => {
     setSaving(true);
     try {
-      await window.shellAPI.chatConfig.remove(tab.accountId, chatId);
-      setPerChat(null);
-      setHint('已恢复全局配置');
+      const result = await window.shellAPI.chatConfig.resetTranslate(tab.accountId, chatId);
+      const config = result?.config || null;
+      setPerChat(config);
+      setForm((prev) => ({
+        ...prev,
+        ...(envDefaults || {}),
+        ...(config || {}),
+        nickname: config?.nickname ?? prev.nickname,
+        remark: config?.remark ?? prev.remark,
+      }));
+      setHint('已恢复环境默认设置');
     } catch (error) {
-      console.error('[Renderer] 恢复全局配置失败', error);
+      console.error('[Renderer] 恢复环境默认失败', error);
       setHint('恢复失败');
     } finally {
       setSaving(false);
     }
   };
 
-  // 昵称/备注失焦即保存（只更新昵称/备注，不影响其它配置）
+  // 昵称/备注失焦即保存（同时把已改动的翻译项一起落盘）
   const handleIdentityBlur = async () => {
     if (!chatId) return;
     try {
-      await window.shellAPI.chatConfig.save({
+      const result = await window.shellAPI.chatConfig.save({
         accountId: tab.accountId,
         chatId,
-        channel: form.channel,
-        roleId: form.roleId,
-        translateOutgoing: form.translateOutgoing,
-        translateIncoming: form.translateIncoming,
-        sourceLang: form.sourceLang,
-        targetLang: form.targetLang,
-        nickname: form.nickname,
-        remark: form.remark,
+        ...buildPatch(),
       });
-      setPerChat({ ...form });
+      if (result && result.ok === false) throw new Error(result.error || '保存失败');
+      setPerChat(result?.config || null);
       setHint('已保存');
     } catch (error) {
       console.error('[Renderer] 保存昵称/备注失败', error);
@@ -192,7 +268,7 @@ export default function PerChatConfigPanel({
         className="absolute left-0 top-0 z-20 h-full w-1 cursor-col-resize bg-transparent transition hover:bg-shell-wa"
         title="拖拽调整宽度"
       />
-      <div className="flex items-center justify-between border-b border-shell-line px-4 py-3">
+        <div className="flex items-center justify-between border-b border-shell-line px-4 py-3">
         <div className="flex items-center gap-2">
           <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 text-shell-muted" fill="currentColor" aria-hidden="true">
             <circle cx="5" cy="3" r="1.2" />
@@ -203,6 +279,9 @@ export default function PerChatConfigPanel({
             <circle cx="11" cy="13" r="1.2" />
           </svg>
           <h2 className="text-sm font-medium text-shell-text">独立翻译设置</h2>
+          <span className="rounded-full bg-[#202c33] px-2 py-[2px] text-[10px] text-shell-muted">
+            仅当前对话
+          </span>
         </div>
         <button
           type="button"
@@ -224,21 +303,34 @@ export default function PerChatConfigPanel({
         ) : (
           <div className="space-y-3">
             <div className="rounded-lg border border-shell-line bg-[#111b21] px-3 py-2 text-xs text-shell-muted">
-              <div>
-                账户：<span className="text-shell-text">{tab?.name}</span>
-              </div>
-              <div className="truncate" title={chatTitle}>
-                对话：<span className="text-shell-text">{chatTitle || chatId}</span>
+              <div
+                role="button"
+                tabIndex={0}
+                title={`点击复制号码 ${displayChatId}`}
+                onClick={handleCopyChatId}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    handleCopyChatId();
+                  }
+                }}
+                className="flex cursor-pointer items-center gap-2 rounded transition hover:text-shell-text"
+              >
+                <span className="shrink-0">对话：</span>
+                <span className="truncate font-medium text-shell-text" title={displayChatId}>
+                  {displayChatId}
+                </span>
+                <span className="shrink-0 text-[10px]">{copied ? '已复制' : '复制'}</span>
               </div>
             </div>
 
-            {perChat ? (
+            {overrideKeys.length > 0 ? (
               <div className="rounded-lg border border-[#005c4b]/40 bg-[#005c4b]/10 px-3 py-2 text-[11px] text-shell-wa">
-                已启用独立配置，覆盖全局翻译设置
+                本对话单独设置了 {overrideKeys.length} 项，优先级高于环境默认和全局
               </div>
             ) : (
               <div className="rounded-lg border border-shell-line bg-[#111b21] px-3 py-2 text-[11px] text-shell-muted">
-                当前使用全局默认配置
+                当前跟随「环境默认」设置（右键标签 →「独立翻译设置」可改本环境默认值）
               </div>
             )}
 
@@ -259,7 +351,6 @@ export default function PerChatConfigPanel({
                     value={form.nickname}
                     onChange={(value) => setField('nickname', value)}
                     onBlur={handleIdentityBlur}
-                    placeholder="如：拉菲·梅辛格 5409"
                   />
                 </Field>
 
@@ -271,7 +362,6 @@ export default function PerChatConfigPanel({
                       maxLength={120}
                       onChange={(event) => setField('remark', event.target.value)}
                       onBlur={handleIdentityBlur}
-                      placeholder="如：资深机械技术员"
                       className="w-full resize-y rounded-xl border border-shell-line bg-[#111b21] px-3 py-2 text-sm leading-6 text-shell-text outline-none transition focus:border-shell-accent"
                     />
                     <span className="absolute bottom-2 right-3 text-[11px] text-shell-muted">
@@ -307,36 +397,51 @@ export default function PerChatConfigPanel({
                     checked={form.translateIncoming}
                     onChange={(value) => setField('translateIncoming', value)}
                   />
+                  <Switch
+                    label="禁止发送中文"
+                    checked={form.blockChinese !== false}
+                    onChange={(value) => setField('blockChinese', value)}
+                  />
                 </div>
+                <p className="-mt-1 text-[11px] leading-5 text-shell-muted">
+                  打开后，任何含中文的内容都不会发给客户（会自动先翻译成目标语言）。
+                </p>
 
-                <div className="grid grid-cols-2 gap-3">
-                  <Field label="源语言">
+                <div className="grid grid-cols-1 gap-3">
+                  <Field label="发出翻译目标语言">
                     <DarkSelect
-                      value={form.sourceLang}
-                      onChange={(value) => setField('sourceLang', value)}
-                      options={LANGUAGES}
+                      value={form.outgoingLang || 'he'}
+                      onChange={(value) => setField('outgoingLang', value)}
+                      options={OUTGOING_LANGUAGES}
                     />
                   </Field>
-                  <Field label="目标语言">
+                  <p className="-mt-1 text-[11px] leading-5 text-shell-muted">
+                    你写的中文会翻译成这个语言发给客户。
+                  </p>
+                  <Field label="接收翻译目标语言">
                     <DarkSelect
-                      value={form.targetLang}
+                      value={form.targetLang || 'zh-CN'}
                       onChange={(value) => setField('targetLang', value)}
-                      options={LANGUAGES.filter((item) => item.id !== 'auto')}
+                      options={INCOMING_LANGUAGES}
                     />
                   </Field>
+                  <p className="-mt-1 text-[11px] leading-5 text-shell-muted">
+                    客户发来的消息会翻译成这个语言给你看。
+                  </p>
                 </div>
 
                 <div className="flex items-center justify-between pt-1">
                   <span className="text-xs text-shell-muted">{hint}</span>
                   <div className="flex gap-2">
-                    {perChat && (
+                    {overrideKeys.length > 0 && (
                       <button
                         type="button"
                         disabled={saving}
+                        title="只清掉本对话的翻译覆盖，昵称/备注保留"
                         className="rounded-lg px-3 py-1.5 text-sm text-[#f87171] transition hover:bg-shell-hover"
                         onClick={handleReset}
                       >
-                        恢复全局
+                        恢复环境默认
                       </button>
                     )}
                     <button

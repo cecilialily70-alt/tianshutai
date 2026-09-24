@@ -2,11 +2,15 @@
   "name": "tianshutai",
   "version": "0.1.0",
   "description": "天枢台 — 多标签出海聚合客服",
+  "author": "天枢台",
+  "license": "UNLICENSED",
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build": "vite build",
-    "start": "electron ."
+    "start": "electron .",
+    "dist": "electron-builder --win",
+    "icon": "node build/make-icon.js"
   },
   "dependencies": {
     "electron-store": "^8.2.0",
@@ -19,6 +23,7 @@
     "autoprefixer": "^10.4.20",
     "concurrently": "^9.1.2",
     "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "vite": "^5.4.11",
